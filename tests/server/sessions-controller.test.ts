@@ -12,6 +12,14 @@ const getLocalUsageStatsMock = vi.fn()
 const getActiveProfileNameMock = vi.fn()
 const loggerWarnMock = vi.fn()
 const getCompressionSnapshotMock = vi.fn()
+const listSessionSummariesMock = vi.fn()
+const localListSessionsMock = vi.fn()
+const localListAllSessionsMock = vi.fn()
+const localSearchSessionsMock = vi.fn()
+const localGetSessionDetailMock = vi.fn()
+const localDeleteSessionMock = vi.fn()
+const localRenameSessionMock = vi.fn()
+const useLocalSessionStoreMock = vi.fn(() => false)
 
 vi.mock('../../packages/server/src/db/hermes/conversations-db', () => ({
   listConversationSummariesFromDb: listConversationSummariesFromDbMock,
@@ -38,15 +46,20 @@ vi.mock('../../packages/server/src/services/hermes/hermes-cli', () => ({
 }))
 
 vi.mock('../../packages/server/src/db/hermes/sessions-db', () => ({
-  listSessionSummaries: vi.fn(),
+  listSessionSummaries: listSessionSummariesMock,
   searchSessionSummaries: vi.fn(),
   getSessionDetailFromDb: getSessionDetailFromDbMock,
   getUsageStatsFromDb: getUsageStatsFromDbMock,
 }))
 
-// Mock useLocalSessionStore to return false so we test the CLI path
 vi.mock('../../packages/server/src/db/hermes/session-store', () => ({
-  useLocalSessionStore: () => false,
+  listSessions: localListSessionsMock,
+  listAllSessions: localListAllSessionsMock,
+  searchSessions: localSearchSessionsMock,
+  getSessionDetail: localGetSessionDetailMock,
+  deleteSession: localDeleteSessionMock,
+  renameSession: localRenameSessionMock,
+  useLocalSessionStore: useLocalSessionStoreMock,
 }))
 
 vi.mock('../../packages/server/src/db/hermes/usage-store', () => ({
@@ -95,6 +108,15 @@ describe('session conversations controller', () => {
     listConversationSummariesMock.mockReset()
     getConversationDetailMock.mockReset()
     getSessionDetailFromDbMock.mockReset()
+    listSessionSummariesMock.mockReset()
+    localListSessionsMock.mockReset()
+    localListAllSessionsMock.mockReset()
+    localSearchSessionsMock.mockReset()
+    localGetSessionDetailMock.mockReset()
+    localDeleteSessionMock.mockReset()
+    localRenameSessionMock.mockReset()
+    useLocalSessionStoreMock.mockReset()
+    useLocalSessionStoreMock.mockReturnValue(false)
     getUsageStatsFromDbMock.mockReset()
     getSessionMock.mockReset()
     getGroupChatServerMock.mockReset()
@@ -104,6 +126,40 @@ describe('session conversations controller', () => {
     getActiveProfileNameMock.mockReturnValue('default')
     loggerWarnMock.mockReset()
     getCompressionSnapshotMock.mockReset()
+  })
+
+  it('lists all local-store sessions across profiles by default', async () => {
+    useLocalSessionStoreMock.mockReturnValue(true)
+    localListAllSessionsMock.mockReturnValue([
+      { id: 'hefeng-new', profile: 'hefeng', source: 'api_server', last_active: 30 },
+      { id: 'minion59-mid', profile: 'minion59', source: 'api_server', last_active: 20 },
+      { id: 'default-old', profile: 'default', source: 'api_server', last_active: 10 },
+    ])
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { query: { source: 'api_server', limit: '50' }, body: null }
+    await mod.list(ctx)
+
+    expect(localListAllSessionsMock).toHaveBeenCalledWith('api_server', 50)
+    expect(localListSessionsMock).not.toHaveBeenCalled()
+    expect(ctx.body.sessions.map((s: any) => s.profile)).toEqual(['hefeng', 'minion59', 'default'])
+  })
+
+  it('lists only the requested profile in local-store mode when query.profile is explicit', async () => {
+    useLocalSessionStoreMock.mockReturnValue(true)
+    localListSessionsMock.mockReturnValue([
+      { id: 'hefeng-only', profile: 'hefeng', source: 'api_server', last_active: 30 },
+    ])
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { query: { profile: ' hefeng ', limit: '2' }, body: null }
+    await mod.list(ctx)
+
+    expect(localListSessionsMock).toHaveBeenCalledWith('hefeng', undefined, 2)
+    expect(localListAllSessionsMock).not.toHaveBeenCalled()
+    expect(ctx.body.sessions).toEqual([
+      { id: 'hefeng-only', profile: 'hefeng', source: 'api_server', last_active: 30 },
+    ])
   })
 
   it('prefers the DB-backed conversations summary path', async () => {

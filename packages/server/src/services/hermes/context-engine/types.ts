@@ -26,11 +26,11 @@ export interface CompressionConfig {
 }
 
 export const DEFAULT_COMPRESSION_CONFIG: CompressionConfig = {
-    triggerTokens: 100_000,
+    triggerTokens: 191_000,
     maxHistoryTokens: 32_000,
     tailMessageCount: 20,
     charsPerToken: 6,
-    summarizationTimeoutMs: 30_000,
+    summarizationTimeoutMs: 360_000,
 }
 
 // ─── Compression Output ────────────────────────────────────

@@ -2,6 +2,7 @@ import { request, getApiKey, getBaseUrlValue } from '../client'
 
 export interface SessionSummary {
   id: string
+  profile?: string
   source: string
   model: string
   title: string | null

@@ -54,7 +54,7 @@ export const DEFAULT_COMPRESSION_CONFIG: CompressionConfig = {
   triggerTokens: 100_000,
   summaryBudget: 8_000,
   tailMessageCount: 20,
-  summarizationTimeoutMs: 120_000,
+  summarizationTimeoutMs: 360_000,
 }
 
 export interface CompressedResult {
@@ -67,6 +67,8 @@ export interface CompressedResult {
     summaryTokenEstimate: number
     verbatimCount: number
     compressedStartIndex: number
+    error?: string
+    skippedReason?: string
   }
 }
 
@@ -98,6 +100,71 @@ export function countTokensForModel(text: string, model: string): number {
   } catch {
     return countTokens(text)
   }
+}
+
+export function estimateMessagesTokens(messages: ChatMessage[]): number {
+  return messages.reduce((sum, message) => {
+    const content = typeof message.content === 'string'
+      ? message.content
+      : JSON.stringify(message.content ?? '')
+    const toolCalls = message.tool_calls?.length ? JSON.stringify(message.tool_calls) : ''
+    return sum + countTokens(content) + countTokens(toolCalls)
+  }, 0)
+}
+
+const SUMMARY_INPUT_TOTAL_CHAR_BUDGET = 60_000
+const SUMMARY_INPUT_PER_MESSAGE_CHAR_BUDGET = 2_400
+const SUMMARY_INPUT_HEAD_MESSAGES = 6
+const SUMMARY_INPUT_TAIL_MESSAGES = 36
+
+interface SummarySerializationOptions {
+  maxTotalChars?: number
+  maxPerMessageChars?: number
+  headMessages?: number
+  tailMessages?: number
+}
+
+function truncateMiddle(text: string, maxChars: number): string {
+  if (maxChars <= 0 || text.length <= maxChars) return text
+  if (maxChars <= 80) return text.slice(0, maxChars)
+  const marker = `\n... [truncated ${text.length - maxChars} chars] ...\n`
+  const head = Math.ceil((maxChars - marker.length) * 0.6)
+  const tail = Math.max(0, maxChars - marker.length - head)
+  return text.slice(0, head) + marker + text.slice(-tail)
+}
+
+function contentToString(content: string | ContentBlock[] | undefined): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content.map(block => {
+      if (block.type === 'text') return block.text || ''
+      if (block.type === 'image') return `[Image: ${block.path || ''}]`
+      if (block.type === 'file') return `[File: ${block.path || ''}]`
+      return ''
+    }).join('')
+  }
+  return ''
+}
+
+function serializeOneMessage(msg: ChatMessage, maxPerMessageChars: number): string {
+  const role = msg.role === 'tool' ? `[tool:${msg.name || 'unknown'}]` : msg.role
+  let content = contentToString(msg.content || '')
+
+  if (msg.role === 'tool' && content.length > 5500) {
+    content = content.slice(0, 4000) + '\n... [truncated]\n...' + content.slice(-1500)
+  }
+  content = truncateMiddle(content, maxPerMessageChars)
+
+  if (msg.role === 'assistant' && msg.tool_calls?.length) {
+    const toolsInfo = msg.tool_calls.map(tc => {
+      let args = tc.function.arguments
+      args = truncateMiddle(args, Math.min(1500, maxPerMessageChars))
+      return `[tool_call: ${tc.function.name}(${args})]`
+    }).join('\n')
+    return content.trim() ? `${role}: ${toolsInfo}\n\n${role}: ${content}` : `${role}: ${toolsInfo}`
+  }
+
+  return `${role}: ${content}`
 }
 
 // ─── Prompts ────────────────────────────────────────────
@@ -227,43 +294,47 @@ Write only the summary body. Do not include any preamble or prefix.`
 
 // ─── Pre-cleaning ───────────────────────────────────────
 
-export function serializeForSummary(messages: ChatMessage[]): string {
-  const parts: string[] = []
+export function serializeForSummary(
+  messages: ChatMessage[],
+  options: SummarySerializationOptions = {},
+): string {
+  const maxTotalChars = options.maxTotalChars ?? Number.POSITIVE_INFINITY
+  const maxPerMessageChars = options.maxPerMessageChars ?? Number.POSITIVE_INFINITY
+  const parts = messages.map(msg => serializeOneMessage(msg, maxPerMessageChars))
 
-  function contentToString(content: string | ContentBlock[]): string {
-    if (typeof content === 'string') return content
-    if (Array.isArray(content)) {
-      return content.map(block => {
-        if (block.type === 'text') return block.text || ''
-        if (block.type === 'image') return `[Image: ${block.path || ''}]`
-        if (block.type === 'file') return `[File: ${block.path || ''}]`
-        return ''
-      }).join('')
-    }
-    return ''
+  if (!Number.isFinite(maxTotalChars) || parts.join('\n\n').length <= maxTotalChars) {
+    return parts.join('\n\n')
   }
 
-  for (const msg of messages) {
-    const role = msg.role === 'tool' ? `[tool:${msg.name || 'unknown'}]` : msg.role
-    let content = contentToString(msg.content || '')
+  const selected = new Set<number>()
+  const headMessages = options.headMessages ?? SUMMARY_INPUT_HEAD_MESSAGES
+  const tailMessages = options.tailMessages ?? SUMMARY_INPUT_TAIL_MESSAGES
+  for (let i = 0; i < Math.min(headMessages, parts.length); i++) selected.add(i)
+  for (let i = Math.max(0, parts.length - tailMessages); i < parts.length; i++) selected.add(i)
 
-    if (msg.role === 'tool' && content.length > 5500) {
-      content = content.slice(0, 4000) + '\n... [truncated]\n...' + content.slice(-1500)
-    }
-
-    if (msg.role === 'assistant' && msg.tool_calls?.length) {
-      const toolsInfo = msg.tool_calls.map(tc => {
-        let args = tc.function.arguments
-        if (args.length > 1500) args = args.slice(0, 1500) + '...'
-        return `[tool_call: ${tc.function.name}(${args})]`
-      }).join('\n')
-      parts.push(`${role}: ${toolsInfo}`)
-      if (content.trim()) parts.push(`${role}: ${content}`)
-    } else {
-      parts.push(`${role}: ${content}`)
-    }
+  const remainingBudget = () => maxTotalChars - Array.from(selected).reduce((sum, index) => sum + parts[index].length + 2, 0)
+  // Preserve as many user turns as possible as anchors for the LLM summary.
+  for (let i = headMessages; i < Math.max(headMessages, parts.length - tailMessages); i++) {
+    if (messages[i].role !== 'user') continue
+    if (remainingBudget() <= parts[i].length + 80) break
+    selected.add(i)
   }
-  return parts.join('\n\n')
+
+  const ordered = Array.from(selected).sort((a, b) => a - b)
+  const bounded: string[] = []
+  let previousIndex = -1
+  for (const index of ordered) {
+    if (previousIndex >= 0 && index > previousIndex + 1) {
+      bounded.push(`[... ${index - previousIndex - 1} middle messages omitted to keep summarizer input bounded ...]`)
+    }
+    bounded.push(parts[index])
+    previousIndex = index
+  }
+
+  const result = bounded.join('\n\n')
+  return result.length <= maxTotalChars
+    ? result
+    : truncateMiddle(result, maxTotalChars)
 }
 
 /**
@@ -361,6 +432,98 @@ export function pruneOldToolResults(messages: ChatMessage[], keepRecentCount: nu
   })
 
   return [...pruned, ...tail]
+}
+
+function excerptForFallback(msg: ChatMessage, maxChars: number): string {
+  const role = msg.role === 'tool' ? `[tool:${msg.name || 'unknown'}]` : msg.role
+  const content = truncateMiddle(contentToString(msg.content), maxChars).replace(/\n{3,}/g, '\n\n')
+  return `- ${role}: ${content || '[empty]'}`
+}
+
+function latestUserContent(messages: ChatMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') {
+      return truncateMiddle(contentToString(messages[i].content), 1200) || 'None.'
+    }
+  }
+  return 'None.'
+}
+
+function buildDeterministicFallbackSummary(
+  allMessages: ChatMessage[],
+  compressedMessages: ChatMessage[],
+  tailStart: number,
+  error?: string,
+): string {
+  const firstTurns = compressedMessages.slice(0, 4).map(msg => excerptForFallback(msg, 700))
+  const recentCompressedTurns = compressedMessages.slice(-12).map(msg => excerptForFallback(msg, 900))
+  const userAnchors = compressedMessages
+    .filter(msg => msg.role === 'user')
+    .slice(-10)
+    .map(msg => excerptForFallback(msg, 700))
+
+  return `[Compression fallback summary due to summarizer timeout]
+The LLM summarizer failed while compacting earlier turns, so this deterministic
+snapshot preserves bounded excerpts instead of a semantic LLM summary.
+
+## Active Task
+User asked: "${latestUserContent(allMessages)}"
+
+## Goal
+Continue the current conversation using the compacted excerpts below plus the
+verbatim recent tail messages that follow this summary.
+
+## Constraints & Preferences
+- This is a deterministic fallback snapshot, not an LLM-authored summary.
+- Earlier full content was intentionally omitted to keep the next run under the context budget.
+- Summarizer error: ${error || 'unknown'}
+
+## Completed Actions
+Not available from deterministic fallback. Consult bounded excerpts below for concrete prior turns.
+
+## Active State
+- Total messages at fallback: ${allMessages.length}
+- Messages compacted into this snapshot: 0-${Math.max(0, tailStart - 1)}
+- Recent tail messages are preserved verbatim after this summary.
+
+## In Progress
+Continue from the latest user request and the preserved recent tail.
+
+## Blocked
+LLM summarization failed: ${error || 'unknown'}
+
+## Key Decisions
+- Saved a conservative fallback compression snapshot to prevent repeated expensive full-summary retries.
+- Kept recent tail messages verbatim for continuity.
+
+## Resolved Questions
+Unknown from deterministic fallback.
+
+## Pending User Asks
+Use the latest user request in Active Task and the verbatim tail messages after this summary.
+
+## Relevant Files
+Unknown from deterministic fallback unless shown in excerpts or tail.
+
+## Remaining Work
+Continue the active task using the excerpts and recent tail context.
+
+## Critical Context
+### Recent user-turn anchors from compacted range
+${userAnchors.length ? userAnchors.join('\n') : '- None captured.'}
+
+### First compacted turns
+${firstTurns.length ? firstTurns.join('\n') : '- None captured.'}
+
+### Last compacted turns before verbatim tail
+${recentCompressedTurns.length ? recentCompressedTurns.join('\n') : '- None captured.'}`
+}
+
+function boundedSummaryInput(messages: ChatMessage[]): string {
+  return serializeForSummary(messages, {
+    maxTotalChars: SUMMARY_INPUT_TOTAL_CHAR_BUDGET,
+    maxPerMessageChars: SUMMARY_INPUT_PER_MESSAGE_CHAR_BUDGET,
+  })
 }
 
 // ─── LLM Summarization ──────────────────────────────────
@@ -521,23 +684,64 @@ export class ChatContextCompressor {
     const toCompress = newMessages.slice(0, tailStart)
     const tail = newMessages.slice(tailStart)
 
+    if (toCompress.length === 0) {
+      return {
+        messages: [
+          { role: 'user', content: SUMMARY_PREFIX + '\n\n' + previousSummary },
+          ...tail,
+        ],
+        meta: {
+          ...meta,
+          compressed: true,
+          llmCompressed: false,
+          summaryTokenEstimate: countTokens(SUMMARY_PREFIX + previousSummary),
+          verbatimCount: tail.length,
+          compressedStartIndex: lastMessageIndex,
+          skippedReason: 'no_new_messages_to_summarize',
+        },
+      }
+    }
+
     logger.info(
       '[context-compressor] [incremental-llm] compressing %d of %d new messages, keeping %d tail',
       toCompress.length, newMessages.length, tail.length,
     )
 
     let summary: string | null = null
+    let summarizationError: string | undefined
     try {
-      const contentToSummarize = serializeForSummary(toCompress)
+      const contentToSummarize = boundedSummaryInput(toCompress)
       const prompt = buildIncrementalPrompt(previousSummary, contentToSummarize, this.config.summaryBudget)
-      const history = buildConversationHistory(toCompress)
+      const history: Array<{ role: string; content: string }> = []
 
       const t0 = Date.now()
-      summary = await callSummarizer(upstream, apiKey, prompt, history, this.config.summarizationTimeoutMs, previousSummary, profile)
+      summary = await callSummarizer(upstream, apiKey, prompt, history, this.config.summarizationTimeoutMs, undefined, profile)
       logger.info('[context-compressor] incremental-llm done in %dms, %d chars', Date.now() - t0, summary.length)
     } catch (err: any) {
-      logger.warn('[context-compressor] incremental-llm failed: %s — reusing previous summary', err.message)
-      summary = previousSummary
+      summarizationError = err?.message || 'Summarization failed'
+      logger.warn('[context-compressor] incremental-llm failed: %s — saving deterministic rolling fallback snapshot', summarizationError)
+      const fallbackSummary = buildDeterministicFallbackSummary(messages, toCompress, lastMessageIndex + tailStart, summarizationError)
+      const fallbackResult: ChatMessage[] = [
+        { role: 'user', content: SUMMARY_PREFIX + '\n\n' + fallbackSummary },
+        ...tail,
+      ]
+      const newLastIndex = lastMessageIndex + tailStart
+      if (sessionId) {
+        saveCompressionSnapshot(sessionId, fallbackSummary, newLastIndex, total)
+      }
+      return {
+        messages: fallbackResult,
+        meta: {
+          ...meta,
+          compressed: true,
+          llmCompressed: false,
+          summaryTokenEstimate: countTokens(SUMMARY_PREFIX + fallbackSummary),
+          verbatimCount: tail.length,
+          compressedStartIndex: newLastIndex,
+          error: summarizationError,
+          skippedReason: 'deterministic_incremental_fallback_after_summarization_failed',
+        },
+      }
     }
 
     const result: ChatMessage[] = [
@@ -588,37 +792,63 @@ export class ChatContextCompressor {
       tailStart - 1, tailStart, total - 1,
     )
 
-    const contentToSummarize = serializeForSummary(toCompress)
+    const contentToSummarize = boundedSummaryInput(toCompress)
     const prompt = buildFullPrompt(contentToSummarize, this.config.summaryBudget)
-    const history = buildConversationHistory(toCompress)
+    const history: Array<{ role: string; content: string }> = []
 
     let summary: string | null = null
+    let summarizationError: string | undefined
     try {
       const t0 = Date.now()
       summary = await callSummarizer(upstream, apiKey, prompt, history, this.config.summarizationTimeoutMs, undefined, profile)
       logger.info('[context-compressor] full-llm done in %dms, %d chars', Date.now() - t0, summary.length)
     } catch (err: any) {
-      logger.warn('[context-compressor] full-llm failed: %s', err.message)
+      summarizationError = err?.message || 'Summarization failed'
+      logger.warn('[context-compressor] full-llm failed: %s', summarizationError)
     }
 
-    const result: ChatMessage[] = []
+    if (!summary) {
+      const fallbackSummary = buildDeterministicFallbackSummary(messages, toCompress, tailStart, summarizationError)
+      const result: ChatMessage[] = [
+        { role: 'user', content: SUMMARY_PREFIX + '\n\n' + fallbackSummary },
+        ...tail,
+      ]
 
-    if (summary) {
-      result.push({ role: 'user', content: SUMMARY_PREFIX + '\n\n' + summary })
       if (sessionId) {
-        saveCompressionSnapshot(sessionId, summary, tailStart - 1, total)
+        saveCompressionSnapshot(sessionId, fallbackSummary, tailStart - 1, total)
+      }
+
+      return {
+        messages: result,
+        meta: {
+          ...meta,
+          compressed: true,
+          llmCompressed: false,
+          summaryTokenEstimate: countTokens(SUMMARY_PREFIX + fallbackSummary),
+          verbatimCount: tail.length,
+          compressedStartIndex: tailStart - 1,
+          error: summarizationError,
+          skippedReason: 'deterministic_fallback_after_summarization_failed',
+        },
       }
     }
 
-    result.push(...tail)
+    const result: ChatMessage[] = [
+      { role: 'user', content: SUMMARY_PREFIX + '\n\n' + summary },
+      ...tail,
+    ]
+
+    if (sessionId) {
+      saveCompressionSnapshot(sessionId, summary, tailStart - 1, total)
+    }
 
     return {
       messages: result,
       meta: {
         ...meta,
         compressed: true,
-        llmCompressed: !!summary,
-        summaryTokenEstimate: summary ? countTokens(SUMMARY_PREFIX + summary) : 0,
+        llmCompressed: true,
+        summaryTokenEstimate: countTokens(SUMMARY_PREFIX + summary),
         verbatimCount: tail.length,
         compressedStartIndex: tailStart - 1,
       },

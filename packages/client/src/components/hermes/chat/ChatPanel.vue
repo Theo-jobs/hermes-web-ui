@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { renameSession, setSessionWorkspace, batchDeleteSessions, exportSession } from "@/api/hermes/sessions";
 import { useChatStore, type Session } from "@/stores/hermes/chat";
+import { useAppStore } from "@/stores/hermes/app";
+import { useGatewayRegistryStore } from "@/stores/hermes/gateway-registry";
 import { useSessionBrowserPrefsStore } from "@/stores/hermes/session-browser-prefs";
 import {
   NButton,
@@ -9,12 +11,14 @@ import {
   NModal,
   NTooltip,
   NPopconfirm,
+  NSelect,
   useMessage,
 } from "naive-ui";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { getSourceLabel } from "@/shared/session-display";
 import { copyToClipboard } from "@/utils/clipboard";
+import { filterSessionsForProfileWithFallback } from "./session-profile-filter";
 import FolderPicker from "./FolderPicker.vue";
 import ChatInput from "./ChatInput.vue";
 import ConversationMonitorPane from "./ConversationMonitorPane.vue";
@@ -23,6 +27,8 @@ import SessionListItem from "./SessionListItem.vue";
 import DrawerPanel from "./DrawerPanel.vue";
 
 const chatStore = useChatStore();
+const appStore = useAppStore();
+const gatewayRegistry = useGatewayRegistryStore();
 const sessionBrowserPrefsStore = useSessionBrowserPrefsStore();
 const message = useMessage();
 const { t } = useI18n();
@@ -65,6 +71,9 @@ onMounted(() => {
   mobileQuery = window.matchMedia("(max-width: 768px)");
   handleMobileChange(mobileQuery);
   mobileQuery.addEventListener("change", handleMobileChange);
+  if (gatewayRegistry.gateways.length === 0 && !gatewayRegistry.loading) {
+    void gatewayRegistry.fetchAll();
+  }
 });
 
 onUnmounted(() => {
@@ -98,9 +107,16 @@ interface SessionGroup {
   sessions: Session[];
 }
 
+const visibleSessions = computed(() =>
+  filterSessionsForProfileWithFallback(
+    chatStore.sessions,
+    chatStore.nextSessionProfile,
+  ),
+);
+
 const pinnedSessions = computed(() =>
   sortSessionsWithActiveFirst(
-    chatStore.sessions.filter((session) =>
+    visibleSessions.value.filter((session) =>
       sessionBrowserPrefsStore.isPinned(session.id),
     ),
   ),
@@ -108,7 +124,7 @@ const pinnedSessions = computed(() =>
 
 const groupedSessions = computed<SessionGroup[]>(() => {
   const map = new Map<string, Session[]>();
-  for (const s of chatStore.sessions) {
+  for (const s of visibleSessions.value) {
     if (sessionBrowserPrefsStore.isPinned(s.id)) continue;
     const key = s.source || "";
     if (!map.has(key)) map.set(key, []);
@@ -124,15 +140,10 @@ const groupedSessions = computed<SessionGroup[]>(() => {
 
   return keys.map((key) => ({
     source: key,
-    label: key ? getChatSourceLabel(key) : t("chat.other"),
+    label: key ? getSourceLabel(key) : t("chat.other"),
     sessions: sortSessionsWithActiveFirst(map.get(key)!),
   }));
 });
-
-function getChatSourceLabel(source?: string): string {
-  if (source === "cli") return "Bridge (beta)";
-  return getSourceLabel(source);
-}
 
 function toggleGroup(source: string) {
   const isExpanded = !collapsedGroups.value.has(source);
@@ -209,38 +220,89 @@ const activeSessionSource = computed(() =>
   currentMode.value === "chat" ? chatStore.activeSession?.source || "" : "",
 );
 
-const activeApproval = computed(() => chatStore.activePendingApproval);
+const gatewayById = computed(() => {
+  const map = new Map<string, (typeof gatewayRegistry.gateways)[number]>();
+  for (const gateway of gatewayRegistry.gateways) map.set(gateway.id, gateway);
+  return map;
+});
+
+const gatewayByProfile = computed(() => {
+  const map = new Map<string, (typeof gatewayRegistry.gateways)[number]>();
+  for (const gateway of gatewayRegistry.gateways) map.set(gateway.profile, gateway);
+  return map;
+});
+
+const spaceByProfile = computed(() => {
+  const map = new Map<string, (typeof gatewayRegistry.spaces)[number]>();
+  for (const space of gatewayRegistry.spaces) {
+    if (!map.has(space.profile)) map.set(space.profile, space);
+  }
+  return map;
+});
+
+const gatewayTargetOptions = computed(() => {
+  const seen = new Set<string>();
+  const options = gatewayRegistry.spaces.map((space) => {
+    seen.add(space.profile);
+    const gateway = gatewayById.value.get(space.gatewayId);
+    return {
+      label: `${space.displayName} / ${gateway?.displayName || space.profile}`,
+      value: space.id,
+    };
+  });
+  for (const gateway of gatewayRegistry.gateways) {
+    if (seen.has(gateway.profile)) continue;
+    options.push({
+      label: `${gateway.displayName || gateway.id} / ${gateway.profile}`,
+      value: `profile:${gateway.profile}`,
+    });
+  }
+  return options;
+});
+
+const selectedGatewayTarget = computed({
+  get() {
+    return (
+      chatStore.nextSessionSpaceId ||
+      `profile:${chatStore.nextSessionProfile || "default"}`
+    );
+  },
+  set(value: string) {
+    const space = gatewayRegistry.spaces.find((item) => item.id === value);
+    const profile = space?.profile || value.replace(/^profile:/, "") || "default";
+    const gateway = gatewayByProfile.value.get(profile);
+    chatStore.setNextSessionGateway({
+      profile,
+      spaceId: space?.id || null,
+      model: gateway?.defaultModel || null,
+    });
+    // If this profile already has conversations, make the gateway switch visible
+    // immediately instead of only affecting the next new chat. Empty drafts still
+    // stay bound by setNextSessionGateway above.
+    void chatStore.switchToMostRecentSessionForProfile(profile);
+  },
+});
+
+const activeGateway = computed(() =>
+  gatewayByProfile.value.get(chatStore.activeSession?.profile || ""),
+);
+
+const activeSpace = computed(() => {
+  const session = chatStore.activeSession;
+  if (!session) return null;
+  if (session.spaceId) {
+    const exact = gatewayRegistry.spaces.find((space) => space.id === session.spaceId);
+    if (exact) return exact;
+  }
+  return spaceByProfile.value.get(session.profile || "") || null;
+});
+
+const activeModelLabel = computed(
+  () => chatStore.activeSession?.model || appStore.selectedModel || "default",
+);
 
 function handleNewChat() {
   chatStore.newChat();
-}
-
-function handleNewCliChat() {
-  const session = chatStore.newCliSession()
-  chatStore.switchSession(session.id)
-}
-
-const newChatOptions = computed(() => [
-  {
-    label: "API",
-    key: "api_server",
-  },
-  {
-    label: "Bridge (beta)",
-    key: "cli",
-  },
-]);
-
-function handleNewChatSelect(key: string | number) {
-  if (key === "cli") {
-    handleNewCliChat();
-    return;
-  }
-  handleNewChat();
-}
-
-function handleApproval(choice: "once" | "session" | "always" | "deny") {
-  chatStore.respondApproval(choice);
 }
 
 async function copySessionId(id?: string) {
@@ -591,27 +653,21 @@ async function handleWorkspaceConfirm() {
               </svg>
             </template>
           </NButton>
-          <NDropdown
-            trigger="click"
-            :options="newChatOptions"
-            @select="handleNewChatSelect"
-          >
-            <NButton quaternary size="tiny" circle>
-              <template #icon>
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                >
-                  <line x1="12" y1="5" x2="12" y2="19" />
-                  <line x1="5" y1="12" x2="19" y2="12" />
-                </svg>
-              </template>
-            </NButton>
-          </NDropdown>
+          <NButton quaternary size="tiny" @click="handleNewChat" circle>
+            <template #icon>
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+            </template>
+          </NButton>
         </div>
       </div>
       <div v-if="showSessions" class="session-scope-note">
@@ -764,8 +820,18 @@ async function handleWorkspaceConfirm() {
           </NButton>
           <span class="header-session-title">{{ headerTitle }}</span>
           <span v-if="activeSessionSource" class="source-badge">{{
-            getChatSourceLabel(activeSessionSource)
+            getSourceLabel(activeSessionSource)
           }}</span>
+          <span v-if="activeSpace" class="session-meta-badge">
+            Space: {{ activeSpace.displayName }}
+          </span>
+          <span v-if="chatStore.activeSession" class="session-meta-badge">
+            Gateway:
+            {{ activeGateway?.displayName || chatStore.activeSession.profile || "default" }}
+          </span>
+          <span v-if="chatStore.activeSession" class="session-meta-badge">
+            Model: {{ activeModelLabel }}
+          </span>
           <span
             v-if="chatStore.activeSession?.workspace"
             class="workspace-badge"
@@ -780,6 +846,18 @@ async function handleWorkspaceConfirm() {
         <div class="header-actions">
           <!-- chat/live mode toggle hidden -->
           <template v-if="currentMode === 'chat'">
+            <div class="gateway-target-control">
+              <span class="gateway-target-label">Next chat</span>
+              <NSelect
+                v-model:value="selectedGatewayTarget"
+                size="small"
+                :options="gatewayTargetOptions"
+                :loading="gatewayRegistry.loading"
+                :disabled="gatewayTargetOptions.length === 0"
+                :consistent-menu-width="false"
+                class="gateway-target-select"
+              />
+            </div>
             <NTooltip trigger="hover">
               <template #trigger>
                 <NButton
@@ -807,74 +885,28 @@ async function handleWorkspaceConfirm() {
               </template>
               {{ t("chat.copySessionId") }}
             </NTooltip>
-            <NDropdown
-              trigger="click"
-              :options="newChatOptions"
-              @select="handleNewChatSelect"
-            >
-              <NButton size="small" :circle="isMobile">
-                <template #icon>
-                  <svg
-                    width="14"
-                    height="14"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                  >
-                    <line x1="12" y1="5" x2="12" y2="19" />
-                    <line x1="5" y1="12" x2="19" y2="12" />
-                  </svg>
-                </template>
-                <template v-if="!isMobile">{{ t("chat.newChat") }}</template>
-              </NButton>
-            </NDropdown>
+            <NButton size="small" :circle="isMobile" @click="handleNewChat">
+              <template #icon>
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </template>
+              <template v-if="!isMobile">{{ t("chat.newChat") }}</template>
+            </NButton>
           </template>
         </div>
       </header>
 
       <template v-if="currentMode === 'chat'">
         <MessageList />
-        <div v-if="activeApproval" class="approval-bar">
-          <div class="approval-main">
-            <div class="approval-title">Tool approval required</div>
-            <div class="approval-desc">{{ activeApproval.description }}</div>
-            <code class="approval-command">{{ activeApproval.command }}</code>
-          </div>
-          <div class="approval-actions">
-            <NButton
-              v-if="activeApproval.choices.includes('once')"
-              size="small"
-              type="primary"
-              @click="handleApproval('once')"
-            >
-              Allow once
-            </NButton>
-            <NButton
-              v-if="activeApproval.choices.includes('session')"
-              size="small"
-              @click="handleApproval('session')"
-            >
-              Allow session
-            </NButton>
-            <NButton
-              v-if="activeApproval.choices.includes('always')"
-              size="small"
-              @click="handleApproval('always')"
-            >
-              Always
-            </NButton>
-            <NButton
-              v-if="activeApproval.choices.includes('deny')"
-              size="small"
-              type="error"
-              ghost
-              @click="handleApproval('deny')"
-            >
-              Deny
-            </NButton>
-          </div>
-        </div>
         <ChatInput />
       </template>
       <ConversationMonitorPane
@@ -1233,6 +1265,7 @@ async function handleWorkspaceConfirm() {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 21px 20px;
   border-bottom: 1px solid $border-color;
   flex-shrink: 0;
@@ -1267,11 +1300,44 @@ async function handleWorkspaceConfirm() {
   line-height: 16px;
 }
 
+.session-meta-badge {
+  font-size: 10px;
+  color: $text-secondary;
+  background: rgba(var(--accent-primary-rgb), 0.08);
+  border: 1px solid rgba(var(--accent-primary-rgb), 0.12);
+  padding: 1px 7px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  line-height: 16px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .header-actions {
   display: flex;
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+}
+
+.gateway-target-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+}
+
+.gateway-target-label {
+  color: $text-muted;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.gateway-target-select {
+  width: 230px;
 }
 
 .chat-mode-toggle {
@@ -1283,7 +1349,31 @@ async function handleWorkspaceConfirm() {
 
 @media (max-width: $breakpoint-mobile) {
   .chat-header {
-    padding: 16px 12px 16px 52px;
+    align-items: flex-start;
+    padding: 12px 12px 12px 52px;
+    flex-direction: column;
+  }
+
+  .header-left,
+  .header-actions {
+    width: 100%;
+  }
+
+  .header-left {
+    flex-wrap: wrap;
+  }
+
+  .header-actions {
+    justify-content: flex-end;
+  }
+
+  .gateway-target-control {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .gateway-target-select {
+    width: 100%;
   }
 }
 
@@ -1344,54 +1434,6 @@ async function handleWorkspaceConfirm() {
   &:hover {
     transform: scale(1.1);
   }
-}
-
-.approval-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
-  border-top: 1px solid $border-color;
-  background: $bg-card;
-}
-
-.approval-main {
-  flex: 1;
-  min-width: 0;
-}
-
-.approval-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: $text-primary;
-}
-
-.approval-desc {
-  margin-top: 2px;
-  font-size: 12px;
-  color: $text-secondary;
-}
-
-.approval-command {
-  display: block;
-  margin-top: 6px;
-  max-height: 56px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 12px;
-  color: $text-primary;
-  background: $bg-secondary;
-  border: 1px solid $border-color;
-  border-radius: 6px;
-  padding: 6px 8px;
-}
-
-.approval-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
 }
 
 @keyframes rainbow-glow {

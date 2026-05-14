@@ -193,6 +193,12 @@ export function updateSession(id: string, data: Partial<Omit<HermesSessionRow, '
   db.prepare(`UPDATE ${SESSIONS_TABLE} SET ${fields.join(', ')} WHERE id = ?`).run(...values, id)
 }
 
+export function updateSessionProfile(id: string, profile: string): void {
+  if (!isSqliteAvailable()) return
+  const db = getDb()!
+  db.prepare(`UPDATE ${SESSIONS_TABLE} SET profile = ? WHERE id = ?`).run(profile || 'default', id)
+}
+
 export function deleteSession(id: string): boolean {
   if (!isSqliteAvailable()) return false
   const db = getDb()!
@@ -235,6 +241,43 @@ export function listSessions(profile: string, source?: string, limit = 2000): He
   `
 
   const params: any[] = [profile]
+  if (source) {
+    params.push(source)
+  }
+  params.push(limit)
+
+  const rows = db.prepare(sql).all(...params) as Record<string, unknown>[]
+  return rows.map(mapSessionRow)
+}
+
+export function listAllSessions(source?: string, limit = 2000): HermesSessionRow[] {
+  if (!isSqliteAvailable()) return []
+  const db = getDb()!
+
+  // Use a subquery to generate preview from first user message if not set.
+  // Intentionally does not filter by profile so the Web UI can show sessions
+  // created under any local gateway profile (default, hefeng, minion59, etc.).
+  const sql = `
+    SELECT
+      s.*,
+      COALESCE(
+        s.preview,
+        (
+          SELECT SUBSTR(REPLACE(REPLACE(m.content, CHAR(10), ' '), CHAR(13), ' '), 1, 63)
+          FROM ${MESSAGES_TABLE} m
+          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+          ORDER BY m.timestamp, m.id
+          LIMIT 1
+        ),
+        ''
+      ) AS preview
+    FROM ${SESSIONS_TABLE} s
+    ${source ? 'WHERE s.source = ?' : ''}
+    ORDER BY s.last_active DESC
+    LIMIT ?
+  `
+
+  const params: any[] = []
   if (source) {
     params.push(source)
   }

@@ -40,6 +40,7 @@ import { createServer } from 'net'
 import yaml from 'js-yaml'
 import { logger } from '../logger'
 import { detectHermesHome, getHermesBin } from './hermes-path'
+import { gatewayRegistryService } from './gateway-registry'
 
 const execFileAsync = promisify(execFile)
 
@@ -147,19 +148,52 @@ function isLocalHost(host: string): boolean {
   return ['127.0.0.1', 'localhost', '::1', '[::1]', '0.0.0.0'].includes(host)
 }
 
-function shouldDetachGatewayProcess(): boolean {
-  // In dev mode (nodemon), always detach gateway processes so they survive restarts
-  // Production mode: attach gateways so they can be managed together with the server
-  const override = process.env.HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN?.trim().toLowerCase()
-  const shouldDetach = override === '0' || override === 'false'
+function isLocallyManagedRegistryGateway(gateway: { type?: string; upstream?: string; profile?: string } | null | undefined): boolean {
+  if (!gateway?.profile) return false
+  return gateway.type !== 'remote' && !gateway.upstream
+}
 
-  if (shouldDetach) {
-    console.log('[gateway] Detaching gateway process (dev mode: HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN=' + override + ')')
-  } else {
-    console.log('[gateway] Attaching gateway process (prod mode: HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN=' + (override || 'not set') + ')')
+function getDefaultProfileEnvUpstream(name: string): string | null {
+  if (name !== 'default') return null
+  const upstream = process.env.UPSTREAM?.trim()
+  return upstream ? upstream.replace(/\/+$/, '') : null
+}
+
+function parseDotEnv(content: string): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+
+    const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+    if (!match) continue
+
+    const key = match[1]
+    let value = match[2].trim()
+    const quote = value[0]
+    if ((quote === '"' || quote === "'") && value.endsWith(quote)) {
+      value = value.slice(1, -1)
+    }
+    env[key] = value
+  }
+  return env
+}
+
+export function buildGatewayChildEnv(hermesHome: string, baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  let profileEnv: Record<string, string> = {}
+  const envPath = join(hermesHome, '.env')
+  try {
+    if (existsSync(envPath)) {
+      profileEnv = parseDotEnv(readFileSync(envPath, 'utf-8'))
+    }
+  } catch (err) {
+    logger.debug('Failed to read gateway profile .env for child process: %s', err)
   }
 
-  return shouldDetach
+  // Profile .env fills missing provider keys for the Hermes child, but the
+  // already-running Web UI process remains authoritative for exported values.
+  // HERMES_HOME is the one intentional override so the child reads this profile.
+  return { ...profileEnv, ...baseEnv, HERMES_HOME: hermesHome }
 }
 
 // ============================
@@ -215,28 +249,15 @@ export class GatewayManager {
     }
   }
 
-  /** Read a profile gateway PID, falling back to runtime state when gateway.pid is missing. */
+  /** 从 profile 的 gateway.pid 文件读取 PID（JSON 格式 { "pid": 12345 }） */
   private readPidFile(name: string): number | null {
-    const profilePath = this.profileDir(name)
-    const pidPath = join(profilePath, 'gateway.pid')
+    const pidPath = join(this.profileDir(name), 'gateway.pid')
+    if (!existsSync(pidPath)) return null
 
     try {
-      if (existsSync(pidPath)) {
-        const content = readFileSync(pidPath, 'utf-8').trim()
-        const data = JSON.parse(content)
-        return typeof data.pid === 'number' ? data.pid : parseInt(data.pid, 10) || null
-      }
-    } catch {}
-
-    const statePath = join(profilePath, 'gateway_state.json')
-    if (!existsSync(statePath)) return null
-
-    try {
-      const content = readFileSync(statePath, 'utf-8').trim()
+      const content = readFileSync(pidPath, 'utf-8').trim()
       const data = JSON.parse(content)
-      const pid = typeof data.pid === 'number' ? data.pid : parseInt(data.pid, 10) || null
-      const state = data?.gateway_state
-      return pid && Number.isFinite(pid) && pid > 0 && (state === 'running' || state === 'starting') ? pid : null
+      return typeof data.pid === 'number' ? data.pid : parseInt(data.pid, 10) || null
     } catch {
       return null
     }
@@ -246,13 +267,13 @@ export class GatewayManager {
   // 进程 & 端口检测工具
   // ============================
 
-  /** Check process liveness without sending a terminating signal. */
+  /** 检查进程是否存活（发送信号 0，不实际杀死进程） */
   private isProcessAlive(pid: number): boolean {
     try {
       process.kill(pid, 0)
       return true
-    } catch (err: any) {
-      return err?.code === 'EPERM'
+    } catch {
+      return false
     }
   }
 
@@ -319,11 +340,15 @@ export class GatewayManager {
    *   platforms:
    *     api_server:
    *       enabled: true
-   *       key: ''
    *       cors_origins: '*'
    *       extra:
    *         port: <port>
    *         host: <host>
+   *
+   * Important local patch: never overwrite an existing api_server key.
+   * EKKO uses this key to authenticate its Socket.IO /v1/runs bridge to the
+   * Hermes gateway. Earlier code wrote key='', causing "Invalid API key" and
+   * request-without-reply failures after EKKO startup/restart.
    * 同时清理旧的顶层 port/host（避免 Hermes 读取错误）
    */
   private writeProfilePort(name: string, port: number, host: string): void {
@@ -338,7 +363,6 @@ export class GatewayManager {
       if (!cfg.platforms.api_server.extra) cfg.platforms.api_server.extra = {}
 
       cfg.platforms.api_server.enabled = true
-      cfg.platforms.api_server.key = ''
       cfg.platforms.api_server.cors_origins = '*'
       cfg.platforms.api_server.extra.port = port
       cfg.platforms.api_server.extra.host = host
@@ -384,13 +408,17 @@ export class GatewayManager {
       return { port: existing.port, host }
     }
 
-    // 检查 PID 文件指向的当前 profile 是否仍健康运行
+    // 检查 PID 文件指向的当前 profile 是否仍健康运行。健康检查必须匹配 PID
+    // 的监听端口，避免认领其他 profile 占用的同一个本地端口。
     const pid = this.readPidFile(name)
     if (pid && this.isProcessAlive(pid) && await this.checkHealth(configuredUrl, 1000)) {
-      logger.info('Profile "%s" already running on configured port %d (PID: %d)', name, configuredPort, pid)
-      this.gateways.set(name, { pid, port: configuredPort, host, url: configuredUrl, owned: false })
-      this.allocatedPorts.add(configuredPort)
-      return { port: configuredPort, host }
+      if (await this.pidOwnsLocalPort(pid, configuredPort, host)) {
+        logger.info('Profile "%s" already running on configured port %d (PID: %d)', name, configuredPort, pid)
+        this.gateways.set(name, { pid, port: configuredPort, host, url: configuredUrl, owned: false })
+        this.allocatedPorts.add(configuredPort)
+        return { port: configuredPort, host }
+      }
+      logger.warn('Profile "%s" PID file points to PID %d, but that PID does not own port %d', name, pid, configuredPort)
     }
 
     // 如果没有 PID 文件也没有内存记录，不认领端口上的未知网关
@@ -425,6 +453,12 @@ export class GatewayManager {
   /** 获取指定 profile 的网关 URL（代理路由使用） */
   getUpstream(profileName?: string): string {
     const name = profileName || this.activeProfile
+    const envUpstream = getDefaultProfileEnvUpstream(name)
+    if (envUpstream) return envUpstream
+    const registryGateway = this.getRegistryGateway(name)
+    if (registryGateway?.upstream) return registryGateway.upstream.replace(/\/+$/, '')
+    const remote = this.getRemoteAgentConfig(name)
+    if (remote?.upstream) return remote.upstream
     const gw = this.gateways.get(name)
     if (gw?.url) return gw.url
     const { port, host } = this.readProfilePort(name)
@@ -439,10 +473,100 @@ export class GatewayManager {
       if (!existsSync(envPath)) return null
       const content = readFileSync(envPath, 'utf-8')
       const match = content.match(/^API_SERVER_KEY\s*=\s*"?([^"\n]+)"?/m)
-      return match?.[1]?.trim() || null
+      const value = match?.[1]?.trim() || ''
+      return this.resolveEnvRef(value, content) || null
     } catch {
       return null
     }
+  }
+
+  /** 读取 profile 配置里的 API_SERVER_KEY / api_keyEnv，兼容远端 agent */
+  getApiKeyForUpstream(profileName?: string): string | null {
+    const name = profileName || this.activeProfile
+    try {
+      const registryGateway = this.getRegistryGateway(name)
+      if (registryGateway?.apiKeyEnv) {
+        const registryKey = process.env[registryGateway.apiKeyEnv] || this.readRemoteEnvValue(registryGateway.apiKeyEnv)
+        if (registryKey) return registryKey
+      }
+      const configPath = join(this.profileDir(name), 'config.yaml')
+      const envPath = join(this.profileDir(name), '.env')
+      const remoteEnvPath = join(homedir(), '.hermes-web-ui', '.remote-agents.env')
+      const envContent = [
+        existsSync(envPath) ? readFileSync(envPath, 'utf-8') : '',
+        existsSync(remoteEnvPath) ? readFileSync(remoteEnvPath, 'utf-8') : '',
+      ].join('\n')
+      if (existsSync(configPath)) {
+        const cfg = yaml.load(readFileSync(configPath, 'utf-8')) as any || {}
+        const apiServer = cfg?.platforms?.api_server
+        const byApiServerKey = this.resolveEnvRef(String(apiServer?.extra?.key || apiServer?.key || ''), envContent)
+        // Local default talks to the Hermes gateway child that is configured from
+        // platforms.api_server; do not let a matching custom provider's stale
+        // API_SERVER_KEY in .env override that effective local gateway key.
+        if (name === 'default' && byApiServerKey) return byApiServerKey
+
+        const upstream = this.getUpstream(name).replace(/\/+$/, '')
+        const providers = Array.isArray(cfg.custom_providers) ? cfg.custom_providers : []
+        for (const cp of providers) {
+          const cpBase = String(cp?.base_url || '').replace(/\/+$/, '')
+          if (cpBase && cpBase === upstream) {
+            const byEnvName = String(cp?.apiKeyEnv || cp?.api_key_env || '').trim()
+            if (byEnvName && process.env[byEnvName]) return process.env[byEnvName] || null
+            const byApiKey = this.resolveEnvRef(String(cp?.api_key || cp?.apiKey || ''), envContent)
+            if (byApiKey) return byApiKey
+          }
+        }
+        if (byApiServerKey) return byApiServerKey
+      }
+      const remote = this.getRemoteAgentConfig(name)
+      if (remote?.apiKey) return remote.apiKey
+      const fallbackEnv = join(homedir(), '.hermes-web-ui', '.remote-agents.env')
+      const fallbackContent = existsSync(fallbackEnv) ? readFileSync(fallbackEnv, 'utf-8') : ''
+      const fallbackName = `${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_SERVER_KEY`
+      const fallbackKey = this.resolveEnvRef(`\${${fallbackName}}`, fallbackContent)
+      const apiServerKey = this.resolveEnvRef('${API_SERVER_KEY}', envContent)
+      return fallbackKey || apiServerKey || this.getApiKey(name)
+    } catch {
+      return this.getApiKey(name)
+    }
+  }
+
+
+  private getRemoteAgentConfig(profileName: string): { upstream?: string; apiKey?: string } | null {
+    const remoteEnvPath = join(homedir(), '.hermes-web-ui', '.remote-agents.env')
+    if (!existsSync(remoteEnvPath)) return null
+    const content = readFileSync(remoteEnvPath, 'utf-8')
+    const prefix = profileName.toUpperCase().replace(/[^A-Z0-9]/g, '_')
+    const upstream = this.resolveEnvRef(`\${${prefix}_UPSTREAM}`, content)
+    const apiKey = this.resolveEnvRef(`\${${prefix}_API_SERVER_KEY}`, content)
+    return { upstream: upstream || undefined, apiKey: apiKey || undefined }
+  }
+
+  private getRegistryGateway(profileName: string): { upstream?: string; apiKeyEnv?: string } | null {
+    try {
+      const gateway = gatewayRegistryService
+        .listGateways()
+        .find(g => g.profile === profileName || g.id === profileName)
+      return gateway ? { upstream: gateway.upstream, apiKeyEnv: gateway.apiKeyEnv } : null
+    } catch {
+      return null
+    }
+  }
+
+  private readRemoteEnvValue(key: string): string {
+    const remoteEnvPath = join(homedir(), '.hermes-web-ui', '.remote-agents.env')
+    if (!existsSync(remoteEnvPath)) return ''
+    return this.resolveEnvRef(`\${${key}}`, readFileSync(remoteEnvPath, 'utf-8'))
+  }
+
+  private resolveEnvRef(value: string, envContent = ''): string {
+    const trimmed = String(value || '').trim().replace(/^['"]|['"]$/g, '')
+    const match = trimmed.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/)
+    if (!match) return trimmed
+    const key = match[1]
+    if (process.env[key]) return process.env[key] || ''
+    const envMatch = envContent.match(new RegExp(`^${key}\\s*=\\s*(.+)`, 'm'))
+    return envMatch?.[1]?.trim().replace(/^['"]|['"]$/g, '') || ''
   }
 
   getActiveProfile(): string {
@@ -483,6 +607,49 @@ export class GatewayManager {
   }
 
   /**
+   * Profiles whose local gateway processes are managed by normal Web UI startup.
+   * Keep startup conservative: default/Daily Mac is always managed; additional
+   * local profiles must be declared in the Gateway/Space registry. Plain Hermes
+   * profile directories (for example ad-hoc test profiles) are intentionally not
+   * auto-started or surfaced as managed runtime gateways.
+   */
+  private async listManagedLocalProfiles(): Promise<string[]> {
+    const profiles = await this.listProfiles()
+    const existing = new Set(profiles)
+    const managed = new Set<string>(['default'])
+
+    try {
+      const gateways = gatewayRegistryService.listGateways()
+      const gatewayById = new Map(gateways.map(g => [g.id, g]))
+
+      for (const gateway of gateways) {
+        if (isLocallyManagedRegistryGateway(gateway)) managed.add(gateway.profile)
+      }
+
+      for (const space of gatewayRegistryService.listSpaces()) {
+        if (isLocallyManagedRegistryGateway(gatewayById.get(space.gatewayId))) {
+          managed.add(space.profile)
+        }
+      }
+    } catch (err) {
+      logger.debug('Failed to read gateway registry while filtering managed profiles: %s', err)
+    }
+
+    return profiles.filter(name => existing.has(name) && managed.has(name))
+  }
+
+  /**
+   * A healthy response on a local port is not enough to identify the profile: an
+   * unrelated profile can be listening on the same port. When lsof/netstat can
+   * identify listeners, require the profile PID to own the configured port.
+   */
+  private async pidOwnsLocalPort(pid: number, port: number, host: string): Promise<boolean> {
+    if (!pid || !isLocalHost(host)) return true
+    const listeningPids = await this.getListeningPids(port)
+    return listeningPids.length === 0 || listeningPids.includes(pid)
+  }
+
+  /**
    * 检测单个 profile 的网关状态（只读，不修改任何进程或配置）
    *
    * 流程：
@@ -496,10 +663,14 @@ export class GatewayManager {
     const { port, host } = this.readProfilePort(name)
     const url = buildHttpUrl(host, port)
 
-    // 首先检查 PID 文件：如果存在且进程存活且健康，则标记为运行
+    // 首先检查 PID 文件：如果存在且进程存活、健康、且确实监听该端口，则标记为运行。
+    // 仅健康检查会误把同端口的其他 profile 当成当前 profile。
     if (pid && this.isProcessAlive(pid) && await this.checkHealth(url)) {
-      this.gateways.set(name, { pid, port, host, url, owned: false })
-      return { profile: name, port, host, url, running: true, pid }
+      if (await this.pidOwnsLocalPort(pid, port, host)) {
+        this.gateways.set(name, { pid, port, host, url, owned: false })
+        return { profile: name, port, host, url, running: true, pid }
+      }
+      logger.warn('Ignoring gateway PID %d for profile "%s": it does not own %s', pid, name, url)
     }
 
     // 没有 PID 文件时不认领端口上的未知网关，避免误判其他 profile 的网关
@@ -509,7 +680,7 @@ export class GatewayManager {
 
   /** 检测所有 profile 的网关状态 */
   async listAll(): Promise<GatewayStatus[]> {
-    const profiles = await this.listProfiles()
+    const profiles = await this.listManagedLocalProfiles()
     const statuses = await Promise.all(profiles.map(name => this.detectStatus(name)))
     return statuses
   }
@@ -575,22 +746,18 @@ export class GatewayManager {
       }
     }
 
-    // 所有平台统一使用 run 模式；dev/nodemon 可通过 env 保留 gateway 进程。
+    // 所有平台统一使用 run 模式：子进程跟随父进程生命周期
     return new Promise((resolve, reject) => {
-      const env = { ...process.env, HERMES_HOME: hermesHome }
-      const detachGateway = shouldDetachGatewayProcess()
+      const env = buildGatewayChildEnv(hermesHome)
       const child = spawn(HERMES_BIN, ['gateway', 'run', '--replace'], {
         stdio: 'ignore',
-        detached: detachGateway,
         windowsHide: true,
         env,
       })
-      if (detachGateway) {
-        child.unref()
-      }
+      // 不使用 detached 和 unref，让子进程跟随父进程生命周期
 
       const pid = child.pid ?? 0
-      logger.info('Starting gateway for profile "%s" (run mode, PID: %d, port: %d, detached: %s)', name, pid, port, detachGateway)
+      logger.info('Starting gateway for profile "%s" (run mode, PID: %d, port: %d)', name, pid, port)
 
       // 保存子进程引用，用于后续管理
       this.gateways.set(name, { pid, port, host, url, owned: true, process: child })
@@ -611,6 +778,11 @@ export class GatewayManager {
       if (await this.checkHealth(url, 2000)) {
         // "gateway start" 自行管理进程，重新从 pid 文件读取实际 PID
         const actualPid = this.readPidFile(name) ?? pid
+        if (!(await this.pidOwnsLocalPort(actualPid, port, host))) {
+          logger.debug('Health check for profile "%s" reached %s, but PID %d does not own that port yet', name, url, actualPid)
+          await new Promise(r => setTimeout(r, 500))
+          continue
+        }
         const previous = this.gateways.get(name)
         this.gateways.set(name, {
           pid: actualPid,
@@ -689,7 +861,7 @@ export class GatewayManager {
       const { stdout, stderr } = await execFileAsync(HERMES_BIN, ['gateway', 'stop'], {
         timeout: 15000,
         windowsHide: true,
-        env: { ...process.env, HERMES_HOME: hermesHome },
+        env: buildGatewayChildEnv(hermesHome),
       })
       const output = `${stdout}${stderr}`.trim()
       if (output) logger.debug('%s: hermes gateway stop: %s', name, output)
@@ -819,7 +991,7 @@ export class GatewayManager {
   /** 扫描所有 profile，检测网关运行状态并注册 */
   async detectAllOnStartup(): Promise<void> {
     logger.info('Scanning profiles for running gateways...')
-    const profiles = await this.listProfiles()
+    const profiles = await this.listManagedLocalProfiles()
 
     for (const name of profiles) {
       const status = await this.detectStatus(name)
@@ -842,7 +1014,7 @@ export class GatewayManager {
     // 清空已分配端口集合，确保每次启动都从干净状态开始
     this.allocatedPorts.clear()
 
-    const profiles = await this.listProfiles()
+    const profiles = await this.listManagedLocalProfiles()
     // Phase 1: 顺序处理
     const toStart: Array<{ name: string; endpoint: ResolvedGatewayEndpoint }> = []
     for (const name of profiles) {

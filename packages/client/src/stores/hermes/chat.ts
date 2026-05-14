@@ -1,4 +1,5 @@
-import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
+import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
+import { generateFollowupSuggestions } from '@/api/hermes/followups'
 import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
 import { getApiKey } from '@/api/client'
 import { defineStore } from 'pinia'
@@ -18,6 +19,8 @@ export interface Attachment {
   type: string
   size: number
   url: string
+  path?: string
+  media_type?: string
   file?: File
 }
 
@@ -43,19 +46,11 @@ export interface Message {
   queued?: boolean
 }
 
-export interface PendingApproval {
-  sessionId: string
-  approvalId: string
-  command: string
-  description: string
-  choices: Array<'once' | 'session' | 'always' | 'deny'>
-  allowPermanent: boolean
-  requestedAt: number
-}
-
 export interface Session {
   id: string
   title: string
+  profile?: string
+  spaceId?: string | null
   source?: string
   messages: Message[]
   createdAt: number
@@ -70,11 +65,26 @@ export interface Session {
   workspace?: string | null
 }
 
+type FollowupSource = 'model' | 'fallback'
+type FollowupStatus = 'loading' | 'ready' | 'error'
+
+interface FollowupCacheEntry {
+  sessionId: string
+  messageId: string
+  contentSignature: string
+  suggestions: string[]
+  source: FollowupSource | null
+  status: FollowupStatus
+  error?: string
+  requestId: number
+  updatedAt: number
+}
+
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
 }
 
-async function uploadFiles(attachments: Attachment[]): Promise<{ name: string; path: string }[]> {
+async function uploadFiles(attachments: Attachment[]): Promise<{ name: string; path: string; type?: string; size?: number }[]> {
   if (attachments.length === 0) return []
   const formData = new FormData()
   for (const att of attachments) {
@@ -87,14 +97,14 @@ async function uploadFiles(attachments: Attachment[]): Promise<{ name: string; p
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
   if (!res.ok) throw new Error(`Upload failed: ${res.status}`)
-  const data = await res.json() as { files: { name: string; path: string }[] }
+  const data = await res.json() as { files: { name: string; path: string; type?: string; size?: number }[] }
   return data.files
 }
 
 async function buildContentBlocks(
   content: string,
   attachments?: Attachment[],
-  uploadedFiles?: { name: string; path: string }[]
+  uploadedFiles?: { name: string; path: string; type?: string; size?: number }[]
 ): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = []
 
@@ -109,13 +119,15 @@ async function buildContentBlocks(
       const uploaded = uploadedFiles[i]
       const attachment = attachments[i]
 
+      const mediaType = uploaded.type || attachment?.type || 'application/octet-stream'
+
       // Check if it's an image
-      if (attachment?.type.startsWith('image/')) {
+      if (mediaType.startsWith('image/')) {
         blocks.push({
           type: 'image',
           name: uploaded.name,
           path: uploaded.path,
-          media_type: attachment.type,
+          media_type: mediaType,
         })
       } else {
         // Other files
@@ -123,7 +135,7 @@ async function buildContentBlocks(
           type: 'file',
           name: uploaded.name,
           path: uploaded.path,
-          media_type: attachment?.type,
+          media_type: mediaType,
         })
       }
     }
@@ -228,6 +240,7 @@ function mapHermesSession(s: SessionSummary): Session {
   return {
     id: s.id,
     title: s.title || '',
+    profile: s.profile,
     source: s.source || undefined,
     messages: [],
     createdAt: Math.round(s.started_at * 1000),
@@ -243,6 +256,11 @@ function mapHermesSession(s: SessionSummary): Session {
 
 const STORAGE_KEY_PREFIX = 'hermes_active_session_'
 const LEGACY_STORAGE_KEY = 'hermes_active_session'
+const FOLLOWUP_CACHE_STORAGE_PREFIX = 'hermes_followup_cache_v1_'
+const MAX_PERSISTED_FOLLOWUPS = 80
+const NEXT_SESSION_PROFILE_KEY = 'hermes_next_session_profile'
+const NEXT_SESSION_SPACE_KEY = 'hermes_next_session_space'
+const NEXT_SESSION_MODEL_KEY = 'hermes_next_session_model'
 
 // 获取当前 profile 名称，用于隔离缓存。
 // 从 profiles store 的 activeProfileName（同步 localStorage）读取，
@@ -255,8 +273,54 @@ function getProfileName(): string {
   }
 }
 
-function storageKey(): string { return STORAGE_KEY_PREFIX + getProfileName() }
-function legacyStorageKey(): string | null { return getProfileName() === 'default' ? LEGACY_STORAGE_KEY : null }
+function profileStorageKey(profile?: string | null): string { return STORAGE_KEY_PREFIX + (profile || getProfileName() || 'default') }
+function storageKey(): string { return profileStorageKey(getProfileName()) }
+function legacyStorageKey(profile?: string | null): string | null { return (profile || getProfileName()) === 'default' ? LEGACY_STORAGE_KEY : null }
+function followupStorageKey(): string { return FOLLOWUP_CACHE_STORAGE_PREFIX + getProfileName() }
+
+function followupCacheKey(sessionId: string, messageId: string): string {
+  return `${sessionId}\u0000${messageId}`
+}
+
+function followupContentSignature(message: Message): string {
+  const content = message.content || ''
+  return `${content.length}:${content.slice(0, 64)}:${content.slice(-64)}`
+}
+
+function readFollowupCache(): Record<string, FollowupCacheEntry> {
+  try {
+    const raw = localStorage.getItem(followupStorageKey())
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as Record<string, FollowupCacheEntry>
+    if (!parsed || typeof parsed !== 'object') return {}
+    const out: Record<string, FollowupCacheEntry> = {}
+    for (const [key, value] of Object.entries(parsed)) {
+      if (
+        value
+        && typeof value.sessionId === 'string'
+        && typeof value.messageId === 'string'
+        && typeof value.contentSignature === 'string'
+        && Array.isArray(value.suggestions)
+        && (value.status === 'ready' || value.status === 'error')
+      ) {
+        out[key] = { ...value, requestId: 0 }
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function persistFollowupCache(cache: Record<string, FollowupCacheEntry>) {
+  const persisted = Object.fromEntries(
+    Object.entries(cache)
+      .filter(([, value]) => value.status === 'ready' || value.status === 'error')
+      .sort(([, a], [, b]) => b.updatedAt - a.updatedAt)
+      .slice(0, MAX_PERSISTED_FOLLOWUPS),
+  )
+  setItemBestEffort(followupStorageKey(), JSON.stringify(persisted))
+}
 
 function isQuotaExceededError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false
@@ -322,6 +386,9 @@ function removeItem(key: string) {
 export const useChatStore = defineStore('chat', () => {
   const sessions = ref<Session[]>([])
   const activeSessionId = ref<string | null>(null)
+  const nextSessionProfile = ref<string>(localStorage.getItem(NEXT_SESSION_PROFILE_KEY) || getProfileName())
+  const nextSessionSpaceId = ref<string | null>(localStorage.getItem(NEXT_SESSION_SPACE_KEY))
+  const nextSessionModel = ref<string | null>(localStorage.getItem(NEXT_SESSION_MODEL_KEY))
   const focusMessageId = ref<string | null>(null)
   const streamStates = ref<Map<string, { abort: () => void }>>(new Map())
   /** sessionId → server-reported isWorking status */
@@ -330,11 +397,6 @@ export const useChatStore = defineStore('chat', () => {
   const queueLengths = ref<Map<string, number>>(new Map())
   /** sessionId → queued user messages not yet visible in the transcript */
   const queuedUserMessages = ref<Map<string, Message[]>>(new Map())
-  const pendingApprovals = ref<Map<string, PendingApproval>>(new Map())
-  const activePendingApproval = computed(() => {
-    const sid = activeSessionId.value
-    return sid ? pendingApprovals.value.get(sid) || null : null
-  })
 
   // 自动播放语音开关
   const autoPlaySpeechEnabled = ref(false)
@@ -352,18 +414,27 @@ export const useChatStore = defineStore('chat', () => {
   const isLoadingMessages = ref(false)
   const isRunActive = computed(() => isStreaming.value)
 
-  // Compression state
-  const compressionState = ref<{
+  // Compression state is session-scoped. A single global state leaks a banner
+  // from an active remote/long session into whatever chat the user switches to.
+  type CompressionState = {
     compressing: boolean
     messageCount: number
     beforeTokens: number
     afterTokens: number
     compressed: boolean | null
     error?: string
-  } | null>(null)
+  }
+  const compressionStates = ref<Map<string, CompressionState>>(new Map())
+  const compressionState = computed<CompressionState | null>(() => {
+    const sid = activeSessionId.value
+    return sid ? compressionStates.value.get(sid) || null : null
+  })
 
-  function setCompressionState(state: typeof compressionState.value) {
-    compressionState.value = state
+  function setCompressionStateForSession(sessionId: string, state: CompressionState | null) {
+    const next = new Map(compressionStates.value)
+    if (state) next.set(sessionId, state)
+    else next.delete(sessionId)
+    compressionStates.value = next
   }
 
   const abortState = ref<{
@@ -375,6 +446,24 @@ export const useChatStore = defineStore('chat', () => {
 
   function setAbortState(state: typeof abortState.value) {
     abortState.value = state
+  }
+
+  const followupCache = ref<Record<string, FollowupCacheEntry>>(readFollowupCache())
+  const activeFollowupKey = ref<string | null>(null)
+  const followupRequestSeq = ref(0)
+  const activeFollowup = computed(() => {
+    const key = activeFollowupKey.value
+    return key ? followupCache.value[key] || null : null
+  })
+  const followupSuggestions = computed(() => activeFollowup.value?.suggestions || [])
+  const followupSource = computed<FollowupSource | null>(() => activeFollowup.value?.source || null)
+  const followupLoading = computed(() => activeFollowup.value?.status === 'loading')
+  const followupError = computed(() => activeFollowup.value?.error || null)
+  const followupForSessionId = computed(() => activeFollowup.value?.sessionId || null)
+  const followupForMessageId = computed(() => activeFollowup.value?.messageId || null)
+
+  function clearFollowups() {
+    activeFollowupKey.value = null
   }
 
   const activeSession = ref<Session | null>(null)
@@ -398,11 +487,20 @@ export const useChatStore = defineStore('chat', () => {
       }
       sessions.value = fresh
 
-      // Restore last active session, fallback to most recent
+      // Restore the active session for the selected next gateway/profile.
+      // EKKO chat can target remote profiles (hefeng/minion59) without changing
+      // the global Hermes profile selector, so getProfileName() alone would
+      // restore the default/local chat after a refresh and make remote chats
+      // appear to vanish. Keep a per-target active id and fall back to that
+      // profile's most recent session.
+      const targetProfile = nextSessionProfile.value || getProfileName() || 'default'
       const savedId = activeSessionId.value
-      const targetId = savedId && sessions.value.some(s => s.id === savedId)
+      const savedForTarget = localStorage.getItem(profileStorageKey(targetProfile))
+      const targetId = savedId && sessions.value.some(s => s.id === savedId && (s.profile || 'default') === targetProfile)
         ? savedId
-        : sessions.value[0]?.id
+        : savedForTarget && sessions.value.some(s => s.id === savedForTarget && (s.profile || 'default') === targetProfile)
+          ? savedForTarget
+          : sessions.value.find(s => (s.profile || 'default') === targetProfile)?.id || sessions.value[0]?.id
       if (targetId) {
         await switchSession(targetId)
       }
@@ -438,49 +536,75 @@ export const useChatStore = defineStore('chat', () => {
     const session: Session = {
       id: uid(),
       title: '',
+      profile: nextSessionProfile.value || getProfileName(),
+      spaceId: nextSessionSpaceId.value,
       source: 'api_server',
       messages: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      model: nextSessionModel.value || undefined,
     }
     sessions.value.unshift(session)
     return session
   }
 
-  function newCliSession(): Session {
-    const now = new Date()
-    const ts = [
-      now.getFullYear(),
-      String(now.getMonth() + 1).padStart(2, '0'),
-      String(now.getDate()).padStart(2, '0'),
-      '_',
-      String(now.getHours()).padStart(2, '0'),
-      String(now.getMinutes()).padStart(2, '0'),
-      String(now.getSeconds()).padStart(2, '0'),
-    ].join('')
-    const hex = Math.random().toString(16).slice(2, 8)
-    const session: Session = {
-      id: `${ts}_${hex}`,
-      title: '',
-      source: 'cli',
-      messages: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+  function setNextSessionGateway(target: { profile: string; spaceId?: string | null; model?: string | null }) {
+    const profile = target.profile || 'default'
+    nextSessionProfile.value = profile
+    nextSessionSpaceId.value = target.spaceId || null
+    localStorage.setItem(NEXT_SESSION_PROFILE_KEY, profile)
+    if (nextSessionSpaceId.value) {
+      localStorage.setItem(NEXT_SESSION_SPACE_KEY, nextSessionSpaceId.value)
+    } else {
+      localStorage.removeItem(NEXT_SESSION_SPACE_KEY)
     }
-    sessions.value.unshift(session)
-    return session
+    nextSessionModel.value = target.model || null
+    if (nextSessionModel.value) {
+      localStorage.setItem(NEXT_SESSION_MODEL_KEY, nextSessionModel.value)
+    } else {
+      localStorage.removeItem(NEXT_SESSION_MODEL_KEY)
+    }
+
+    const session = activeSession.value
+    if (!session || session.messages.length > 0 || isSessionLive(session.id)) return
+    session.profile = profile
+    session.spaceId = nextSessionSpaceId.value
+    if (target.model) {
+      session.model = target.model
+    }
+  }
+
+
+  async function switchToMostRecentSessionForProfile(profile: string): Promise<boolean> {
+    const targetProfile = profile || 'default'
+    const savedForTarget = localStorage.getItem(profileStorageKey(targetProfile))
+    const candidates = sessions.value.filter(s => (s.profile || 'default') === targetProfile)
+    const targetId = savedForTarget && candidates.some(s => s.id === savedForTarget)
+      ? savedForTarget
+      : candidates.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]?.id
+    if (!targetId) return false
+    await switchSession(targetId)
+    return true
   }
 
   async function switchSession(sessionId: string, focusId?: string | null) {
+    clearFollowups()
     clearThinkingObservationFor(sessionId)
     activeSessionId.value = sessionId
     focusMessageId.value = focusId ?? null
-    setItemBestEffort(storageKey(), sessionId)
-    const legacyActiveKey = legacyStorageKey()
-    if (legacyActiveKey) removeItem(legacyActiveKey)
-    activeSession.value = sessions.value.find(s => s.id === sessionId) || null
+    const targetSession = sessions.value.find(s => s.id === sessionId) || null
+    activeSession.value = targetSession
 
-    if (!activeSession.value) return
+    if (!targetSession) return
+
+    const targetProfile = targetSession.profile || 'default'
+    setItemBestEffort(profileStorageKey(targetProfile), sessionId)
+    // Keep activeSessionId persistent for the selected gateway target too.
+    if ((nextSessionProfile.value || getProfileName() || 'default') === targetProfile) {
+      setItemBestEffort(profileStorageKey(targetProfile), sessionId)
+    }
+    const legacyActiveKey = legacyStorageKey(targetProfile)
+    if (legacyActiveKey) removeItem(legacyActiveKey)
 
     isLoadingMessages.value = true
 
@@ -505,16 +629,24 @@ export const useChatStore = defineStore('chat', () => {
           } else if (!data.isWorking) {
             setAbortState(null)
           }
-          if (data.inputTokens != null) activeSession.value!.inputTokens = data.inputTokens
-          if (data.outputTokens != null) activeSession.value!.outputTokens = data.outputTokens
+          if (data.inputTokens != null) targetSession.inputTokens = data.inputTokens
+          if (data.outputTokens != null) targetSession.outputTokens = data.outputTokens
           if (data.messages?.length) {
-            activeSession.value!.messages = mapHermesMessages(data.messages as any[])
+            targetSession.messages = mapHermesMessages(data.messages as any[])
+            if (!data.isWorking) {
+              // Re-opening or switching to an existing conversation should restore
+              // the follow-up chips for the latest completed assistant message.
+              // Previously followups were only generated after a live run.completed
+              // event, so refreshed sessions showed the transcript but lost the
+              // suggested next questions until another message was sent.
+              void refreshFollowups(sessionId)
+            }
           }
-          if (!activeSession.value!.title) {
-            const firstUser = activeSession.value!.messages.find(m => m.role === 'user')
+          if (!targetSession.title) {
+            const firstUser = targetSession.messages.find(m => m.role === 'user')
             if (firstUser) {
               const t = firstUser.content.slice(0, 40)
-              activeSession.value!.title = t + (firstUser.content.length > 40 ? '...' : '')
+              targetSession.title = t + (firstUser.content.length > 40 ? '...' : '')
             }
           }
           // Process replayed events (compression state etc.)
@@ -522,7 +654,7 @@ export const useChatStore = defineStore('chat', () => {
             for (const evt of data.events) {
               const e = evt.data as any
               if (e.event === 'compression.started') {
-                setCompressionState({
+                setCompressionStateForSession(sessionId, {
                   compressing: true,
                   messageCount: e.message_count || 0,
                   beforeTokens: e.token_count || 0,
@@ -530,7 +662,7 @@ export const useChatStore = defineStore('chat', () => {
                   compressed: null,
                 })
               } else if (e.event === 'compression.completed') {
-                setCompressionState({
+                setCompressionStateForSession(sessionId, {
                   compressing: false,
                   messageCount: e.totalMessages || 0,
                   beforeTokens: e.beforeTokens || 0,
@@ -542,49 +674,6 @@ export const useChatStore = defineStore('chat', () => {
                 setAbortState({ aborting: true, synced: null })
               } else if (e.event === 'abort.completed') {
                 setAbortState({ aborting: false, synced: e.synced ?? false })
-              } else if (e.event === 'approval.requested') {
-                setPendingApproval({ ...e, session_id: sessionId } as RunEvent)
-              } else if (e.event === 'approval.resolved') {
-                clearPendingApproval({ ...e, session_id: sessionId } as RunEvent)
-              } else if (e.event === 'tool.started') {
-                const msgs = getSessionMsgs(sessionId)
-                const toolCallId = e.tool_call_id as string | undefined
-                const existingTool = toolCallId
-                  ? msgs.find(m => m.role === 'tool' && m.toolCallId === toolCallId)
-                  : null
-                if (existingTool) {
-                  updateMessage(sessionId, existingTool.id, {
-                    toolName: e.tool || e.name,
-                    toolArgs: typeof e.arguments === 'string' ? e.arguments : existingTool.toolArgs,
-                    toolPreview: e.preview || existingTool.toolPreview,
-                    toolStatus: existingTool.toolStatus || 'running',
-                  })
-                } else {
-                  addMessage(sessionId, {
-                    id: uid(),
-                    role: 'tool',
-                    content: '',
-                    timestamp: Date.now(),
-                    toolName: e.tool || e.name,
-                    toolCallId,
-                    toolPreview: e.preview,
-                    toolArgs: typeof e.arguments === 'string' ? e.arguments : undefined,
-                    toolStatus: 'running',
-                  })
-                }
-              } else if (e.event === 'tool.completed') {
-                const msgs = getSessionMsgs(sessionId)
-                const toolCallId = e.tool_call_id as string | undefined
-                const toolMsgs = toolCallId
-                  ? msgs.filter(m => m.role === 'tool' && m.toolCallId === toolCallId)
-                  : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
-                if (toolMsgs.length > 0) {
-                  updateMessage(sessionId, toolMsgs[toolMsgs.length - 1].id, {
-                    toolStatus: e.error === true ? 'error' : 'done',
-                    toolDuration: e.duration,
-                    toolResult: typeof e.output === 'string' ? e.output : undefined,
-                  })
-                }
               }
             }
           }
@@ -594,7 +683,9 @@ export const useChatStore = defineStore('chat', () => {
     } catch (err) {
       console.error('Failed to load session messages via resume:', err)
     } finally {
-      isLoadingMessages.value = false
+      if (activeSessionId.value === sessionId) {
+        isLoadingMessages.value = false
+      }
     }
 
     // Resume in-flight run event listeners if needed
@@ -605,7 +696,7 @@ export const useChatStore = defineStore('chat', () => {
     const session = createSession()
     // Inherit current global model
     const appStore = useAppStore()
-    session.model = appStore.selectedModel || undefined
+    session.model = session.model || appStore.selectedModel || undefined
     switchSession(session.id)
   }
 
@@ -641,6 +732,86 @@ export const useChatStore = defineStore('chat', () => {
   function addMessage(sessionId: string, msg: Message) {
     const s = sessions.value.find(s => s.id === sessionId)
     if (s) s.messages.push(msg)
+  }
+
+  async function refreshFollowups(sessionId: string) {
+    const target = sessions.value.find(s => s.id === sessionId)
+    if (!target) return
+    const lastAssistant = [...target.messages].reverse().find(m => m.role === 'assistant' && !m.isStreaming && m.content.trim())
+    if (!lastAssistant) {
+      if (activeSessionId.value === sessionId) clearFollowups()
+      return
+    }
+    const messageId = lastAssistant.id
+    const key = followupCacheKey(sessionId, messageId)
+    const contentSignature = followupContentSignature(lastAssistant)
+    const cached = followupCache.value[key]
+    if (activeSessionId.value === sessionId) {
+      activeFollowupKey.value = key
+    }
+    if (cached?.contentSignature === contentSignature) {
+      return
+    }
+    const requestId = ++followupRequestSeq.value
+    followupCache.value = {
+      ...followupCache.value,
+      [key]: {
+        sessionId,
+        messageId,
+        contentSignature,
+        suggestions: cached?.contentSignature === contentSignature ? cached.suggestions : [],
+        source: cached?.contentSignature === contentSignature ? cached.source : null,
+        status: 'loading',
+        requestId,
+        updatedAt: Date.now(),
+      },
+    }
+    try {
+      const recent = target.messages
+        .filter(m => (m.role === 'user' || m.role === 'assistant') && m.content.trim())
+        .slice(-8)
+        .map(m => ({ role: m.role, content: m.content.slice(0, 1200) }))
+      const profile = useProfilesStore().activeProfileName || undefined
+      const res = await generateFollowupSuggestions({ sessionId, profile, messages: recent })
+      const current = followupCache.value[key]
+      if (!current || current.requestId !== requestId || current.contentSignature !== contentSignature) return
+      followupCache.value = {
+        ...followupCache.value,
+        [key]: {
+          ...current,
+          suggestions: (res.suggestions || []).slice(0, 4),
+          source: res.source,
+          status: 'ready',
+          error: undefined,
+          updatedAt: Date.now(),
+        },
+      }
+      persistFollowupCache(followupCache.value)
+    } catch (err: any) {
+      const current = followupCache.value[key]
+      if (!current || current.requestId !== requestId || current.contentSignature !== contentSignature) return
+      followupCache.value = {
+        ...followupCache.value,
+        [key]: {
+          ...current,
+          suggestions: ['继续', '验证一下', '总结当前状态'],
+          source: 'fallback',
+          status: 'error',
+          error: err?.message || 'Failed to generate follow-ups',
+          updatedAt: Date.now(),
+        },
+      }
+      persistFollowupCache(followupCache.value)
+    } finally {
+      if (activeSessionId.value === sessionId) activeFollowupKey.value = key
+    }
+  }
+
+  async function sendFollowup(text: string) {
+    const value = text.trim()
+    if (!value || followupLoading.value) return
+    clearFollowups()
+    await sendMessage(value)
   }
 
   function addOrUpdateSession(session: Session) {
@@ -683,45 +854,6 @@ export const useChatStore = defineStore('chat', () => {
       session_id: sessionId,
       queue_id: messageId,
     })
-  }
-
-  function setPendingApproval(evt: RunEvent) {
-    const sid = evt.session_id
-    const approvalId = (evt as any).approval_id as string | undefined
-    if (!sid || !approvalId) return
-    const rawChoices = Array.isArray((evt as any).choices) ? (evt as any).choices : ['once', 'session', 'deny']
-    const choices = rawChoices
-      .filter((choice: unknown): choice is PendingApproval['choices'][number] =>
-        choice === 'once' || choice === 'session' || choice === 'always' || choice === 'deny')
-    pendingApprovals.value.set(sid, {
-      sessionId: sid,
-      approvalId,
-      command: String((evt as any).command || ''),
-      description: String((evt as any).description || ''),
-      choices: choices.length ? choices : ['once', 'session', 'deny'],
-      allowPermanent: Boolean((evt as any).allow_permanent),
-      requestedAt: Date.now(),
-    })
-    pendingApprovals.value = new Map(pendingApprovals.value)
-  }
-
-  function clearPendingApproval(evt: RunEvent) {
-    const sid = evt.session_id
-    if (!sid) return
-    const current = pendingApprovals.value.get(sid)
-    if (!current) return
-    const approvalId = (evt as any).approval_id
-    if (approvalId && current.approvalId !== approvalId) return
-    pendingApprovals.value.delete(sid)
-    pendingApprovals.value = new Map(pendingApprovals.value)
-  }
-
-  function respondApproval(choice: PendingApproval['choices'][number]) {
-    const pending = activePendingApproval.value
-    if (!pending) return
-    respondToolApproval(pending.sessionId, pending.approvalId, choice)
-    pendingApprovals.value.delete(pending.sessionId)
-    pendingApprovals.value = new Map(pendingApprovals.value)
   }
 
   function showNextQueuedUserMessage(sessionId: string) {
@@ -767,6 +899,7 @@ export const useChatStore = defineStore('chat', () => {
   async function sendMessage(content: string, attachments?: Attachment[]) {
     if ((!content.trim() && !(attachments && attachments.length > 0))) return
 
+    clearFollowups()
     primeCompletionBellIfEnabled()
 
     if (!activeSession.value) {
@@ -774,8 +907,9 @@ export const useChatStore = defineStore('chat', () => {
       switchSession(session.id)
     }
 
-    // Capture session ID at send time — all callbacks use this, not activeSessionId
+    // Capture session at send time — all callbacks use this, not activeSessionId
     const sid = activeSessionId.value!
+    const sessionAtSend = sessions.value.find(s => s.id === sid) || activeSession.value
     const shouldQueue = isSessionLive(sid)
 
     const userMsg: Message = {
@@ -804,21 +938,32 @@ export const useChatStore = defineStore('chat', () => {
         const token = getApiKey()
         const urlMap = new Map(uploaded.map(f => {
           const base = `/api/hermes/download?path=${encodeURIComponent(f.path)}&name=${encodeURIComponent(f.name)}`
-          return [f.name, token ? `${base}&token=${encodeURIComponent(token)}` : base]
+          return [f.name, {
+            url: token ? `${base}&token=${encodeURIComponent(token)}` : base,
+            path: f.path,
+            media_type: f.type,
+            size: f.size,
+          }]
         }))
+        const hydrateUploadedAttachment = (a: Attachment): Attachment => {
+          const uploadedMeta = urlMap.get(a.name)
+          return uploadedMeta
+            ? {
+                ...a,
+                url: uploadedMeta.url,
+                path: uploadedMeta.path,
+                media_type: uploadedMeta.media_type || a.media_type || a.type,
+                size: uploadedMeta.size ?? a.size,
+              }
+            : a
+        }
         if (shouldQueue && userMsg.attachments) {
-          userMsg.attachments = userMsg.attachments.map(a => {
-            const dl = urlMap.get(a.name)
-            return dl ? { ...a, url: dl } : a
-          })
+          userMsg.attachments = userMsg.attachments.map(hydrateUploadedAttachment)
         } else {
           const msgs = getSessionMsgs(sid)
           const lastUser = msgs.findLast(m => m.id === userMsg.id)
           if (lastUser?.attachments) {
-            lastUser.attachments = lastUser.attachments.map(a => {
-              const dl = urlMap.get(a.name)
-              return dl ? { ...a, url: dl } : a
-            })
+            lastUser.attachments = lastUser.attachments.map(hydrateUploadedAttachment)
           }
         }
 
@@ -830,13 +975,14 @@ export const useChatStore = defineStore('chat', () => {
       }
 
       const appStore = useAppStore()
-      const sessionModel = activeSession.value?.model || appStore.selectedModel
+      const currentSession = sessions.value.find(s => s.id === sid) || sessionAtSend
+      const sessionModel = currentSession?.model || appStore.selectedModel
       const runPayload = {
         input,
         session_id: sid,
         model: sessionModel || undefined,
+        profile: currentSession?.profile || nextSessionProfile.value || undefined,
         queue_id: userMsg.id,
-        source: (activeSession.value?.source === 'cli' ? 'cli' : 'api_server') as 'cli' | 'api_server',
       }
 
       if (shouldQueue) {
@@ -898,7 +1044,7 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'compression.started': {
-              setCompressionState({
+              setCompressionStateForSession(sid, {
                 compressing: true,
                 messageCount: (evt as any).message_count || 0,
                 beforeTokens: (evt as any).token_count || 0,
@@ -909,7 +1055,7 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'compression.completed': {
-              setCompressionState({
+              setCompressionStateForSession(sid, {
                 compressing: false,
                 messageCount: (evt as any).totalMessages || 0,
                 beforeTokens: (evt as any).beforeTokens || 0,
@@ -919,8 +1065,9 @@ export const useChatStore = defineStore('chat', () => {
               })
               // Auto-clear after 5s
               setTimeout(() => {
-                if (compressionState.value && !compressionState.value.compressing) {
-                  setCompressionState(null)
+                const state = compressionStates.value.get(sid)
+                if (state && !state.compressing) {
+                  setCompressionStateForSession(sid, null)
                 }
               }, 5000)
               break
@@ -1089,16 +1236,6 @@ export const useChatStore = defineStore('chat', () => {
               break
             }
 
-            case 'approval.requested': {
-              setPendingApproval(evt)
-              break
-            }
-
-            case 'approval.resolved': {
-              clearPendingApproval(evt)
-              break
-            }
-
             case 'run.completed': {
               const msgs = getSessionMsgs(sid)
               const lastMsg = activeAssistantMessageId
@@ -1198,6 +1335,9 @@ export const useChatStore = defineStore('chat', () => {
               }
               activeAssistantMessageId = null
               updateSessionTitle(sid)
+              if (!swallowedError && (runProducedAssistantText || finalOutputTrimmed !== '')) {
+                void refreshFollowups(sid)
+              }
               break
             }
 
@@ -1347,7 +1487,7 @@ export const useChatStore = defineStore('chat', () => {
           break
 
         case 'compression.started': {
-          setCompressionState({
+          setCompressionStateForSession(sid, {
             compressing: true,
             messageCount: (evt as any).message_count || 0,
             beforeTokens: (evt as any).token_count || 0,
@@ -1358,7 +1498,7 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         case 'compression.completed': {
-          setCompressionState({
+          setCompressionStateForSession(sid, {
             compressing: false,
             messageCount: (evt as any).totalMessages || 0,
             beforeTokens: (evt as any).beforeTokens || 0,
@@ -1367,8 +1507,9 @@ export const useChatStore = defineStore('chat', () => {
             error: (evt as any).error,
           })
           setTimeout(() => {
-            if (compressionState.value && !compressionState.value.compressing) {
-              setCompressionState(null)
+            const state = compressionStates.value.get(sid)
+            if (state && !state.compressing) {
+              setCompressionStateForSession(sid, null)
             }
           }, 5000)
           break
@@ -1526,16 +1667,6 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
-        case 'approval.requested': {
-          setPendingApproval(evt)
-          break
-        }
-
-        case 'approval.resolved': {
-          clearPendingApproval(evt)
-          break
-        }
-
         case 'run.completed': {
           const hasQueue = (evt as any).queue_remaining > 0
           if (hasQueue) {
@@ -1621,6 +1752,9 @@ export const useChatStore = defineStore('chat', () => {
             activeAssistantMessageId = null
           }
           updateSessionTitle(sid)
+          if (!swallowedError && (runProducedAssistantText || finalOutputTrimmed !== '')) {
+            void refreshFollowups(sid)
+          }
           break
         }
 
@@ -1731,6 +1865,8 @@ export const useChatStore = defineStore('chat', () => {
         if (sid && !streamStates.value.has(sid)) {
           // Re-load messages via resume (server loads from DB)
           resumeSession(sid, (data) => {
+            const targetSession = sessions.value.find(s => s.id === sid)
+            if (!targetSession) return
             if (data.isWorking) {
               serverWorking.value.add(sid)
             } else {
@@ -1741,8 +1877,9 @@ export const useChatStore = defineStore('chat', () => {
             } else if (!data.isWorking) {
               setAbortState(null)
             }
-            if (data.messages?.length && activeSession.value) {
-              activeSession.value.messages = mapHermesMessages(data.messages as any[])
+            if (data.messages?.length) {
+              targetSession.messages = mapHermesMessages(data.messages as any[])
+              if (!data.isWorking) void refreshFollowups(sid)
             }
             resumeServerWorkingRun(sid)
           })
@@ -1821,6 +1958,9 @@ export const useChatStore = defineStore('chat', () => {
     sessions,
     activeSessionId,
     activeSession,
+    nextSessionProfile,
+    nextSessionSpaceId,
+    nextSessionModel,
     focusMessageId,
     messages,
     isStreaming,
@@ -1829,17 +1969,25 @@ export const useChatStore = defineStore('chat', () => {
     compressionState,
     abortState,
     isAborting,
+    followupSuggestions,
+    followupSource,
+    followupLoading,
+    followupError,
+    followupForSessionId,
+    followupForMessageId,
+    sendFollowup,
+    clearFollowups,
+    refreshFollowups,
     queueLengths,
     queuedUserMessages,
-    pendingApprovals,
-    activePendingApproval,
     removeQueuedMessage,
     isLoadingSessions,
     sessionsLoaded,
     isLoadingMessages,
 
     newChat,
-    newCliSession,
+    setNextSessionGateway,
+    switchToMostRecentSessionForProfile,
     switchSession,
     switchSessionModel,
     addOrUpdateSession,
@@ -1847,7 +1995,6 @@ export const useChatStore = defineStore('chat', () => {
     deleteSession,
     sendMessage,
     stopStreaming,
-    respondApproval,
     loadSessions,
     refreshActiveSession,
     getThinkingObservation,
