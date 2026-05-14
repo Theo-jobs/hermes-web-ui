@@ -907,6 +907,27 @@ async function handleWorkspaceConfirm() {
 
       <template v-if="currentMode === 'chat'">
         <MessageList />
+        <div
+          v-if="chatStore.followupLoading || chatStore.followupSuggestions.length > 0 || (chatStore.followupError && chatStore.followupSuggestions.length === 0)"
+          class="followup-strip"
+        >
+          <span class="followup-label">可以继续：</span>
+          <span v-if="chatStore.followupLoading" class="followup-loading">生成追问中…</span>
+          <template v-else-if="chatStore.followupSuggestions.length > 0">
+            <NButton
+              v-for="suggestion in chatStore.followupSuggestions"
+              :key="suggestion"
+              size="tiny"
+              secondary
+              round
+              class="followup-chip"
+              @click="chatStore.sendFollowup(suggestion)"
+            >
+              {{ suggestion }}
+            </NButton>
+          </template>
+          <span v-else class="followup-error">追问暂不可用</span>
+        </div>
         <ChatInput />
       </template>
       <ConversationMonitorPane
@@ -1345,6 +1366,38 @@ async function handleWorkspaceConfirm() {
   align-items: center;
   gap: 4px;
   margin-right: 4px;
+}
+
+.followup-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 16px 4px;
+  border-top: 1px solid rgba($border-color, 0.5);
+  background: rgba($bg-card, 0.58);
+  flex-shrink: 0;
+}
+
+.followup-label,
+.followup-loading,
+.followup-error {
+  font-size: 12px;
+  color: $text-muted;
+  line-height: 22px;
+}
+
+.followup-chip {
+  max-width: min(260px, 70vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: $breakpoint-mobile) {
+  .followup-strip {
+    padding: 6px 10px 3px;
+    gap: 5px;
+  }
 }
 
 @media (max-width: $breakpoint-mobile) {
