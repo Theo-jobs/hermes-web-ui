@@ -29,6 +29,29 @@
 
 ---
 
+## EKKO fork branch
+
+This fork keeps `main` aligned with the upstream project and uses `master` as the long-lived branch for EKKO patches.
+
+Update workflow:
+
+1. Fetch upstream `main`.
+2. Check out `master`.
+3. Merge or rebase the latest upstream `main`.
+4. Resolve conflicts, run tests, then push `master`.
+
+### Additions in the EKKO branch
+
+- Gateway registry and workspace routing: manage local or remote Hermes gateway entries through a JSON-backed registry, route new sessions to a selected workspace, and keep secrets referenced by environment variable name instead of storing raw values.
+- Remote session continuity: remember the last active session per profile/workspace and avoid falling back to the default profile after reload.
+- Follow-up suggestions: generate and display contextual follow-up chips after assistant responses, including wrapping behavior for longer suggestions.
+- Kanban board: create and manage Hermes tasks from the Web UI with board, card, drawer, event, and API support.
+- Model management improvements: provider presets, visible model configuration, model aliases, and context-length settings in the UI.
+- Usage and skills monitoring: richer token/cost views, cache indicators, daily trends, and skill usage statistics.
+- Voice and playback settings: text-to-speech settings with provider options, completion sound controls, and speech input support.
+- Plugin and gateway pages: read-only plugin visibility plus gateway runtime status and registry views.
+- Website/docs package: bundled landing/docs site build alongside the dashboard.
+
 ## Features
 
 ### AI Chat
