@@ -256,7 +256,7 @@ export function listAllSessions(source?: string, limit = 2000): HermesSessionRow
 
   // Use a subquery to generate preview from first user message if not set.
   // Intentionally does not filter by profile so the Web UI can show sessions
-  // created under any local gateway profile (default, hefeng, minion59, etc.).
+  // created under any local gateway profile (default, remote-agent, remote-peer, etc.).
   const sql = `
     SELECT
       s.*,

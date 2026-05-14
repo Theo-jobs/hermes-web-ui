@@ -67,16 +67,16 @@ describe('chat store routing', () => {
   it('filters chat panel session lists by selected gateway profile and falls back when empty', () => {
     const sessions = [
       { id: 'default-old', profile: 'default', updatedAt: 200 },
-      { id: 'hefeng-old', profile: 'hefeng', updatedAt: 300 },
-      { id: 'minion-old', profile: 'minion59', updatedAt: 250 },
+      { id: 'remote-old', profile: 'remote-agent', updatedAt: 300 },
+      { id: 'minion-old', profile: 'remote-peer', updatedAt: 250 },
     ] as any
 
     expect(filterSessionsForProfileWithFallback(sessions, 'default').map((s: any) => s.id)).toEqual(['default-old'])
-    expect(filterSessionsForProfileWithFallback(sessions, 'hefeng').map((s: any) => s.id)).toEqual(['hefeng-old'])
-    expect(filterSessionsForProfileWithFallback(sessions, 'minion59').map((s: any) => s.id)).toEqual(['minion-old'])
+    expect(filterSessionsForProfileWithFallback(sessions, 'remote-agent').map((s: any) => s.id)).toEqual(['remote-old'])
+    expect(filterSessionsForProfileWithFallback(sessions, 'remote-peer').map((s: any) => s.id)).toEqual(['minion-old'])
     expect(filterSessionsForProfileWithFallback(sessions, 'new-profile').map((s: any) => s.id)).toEqual([
       'default-old',
-      'hefeng-old',
+      'remote-old',
       'minion-old',
     ])
   })
@@ -85,7 +85,7 @@ describe('chat store routing', () => {
     const store = useChatStore()
 
     store.newChat()
-    store.setNextSessionGateway({ profile: 'hefeng', spaceId: 'hefeng-work', model: 'remote-model' })
+    store.setNextSessionGateway({ profile: 'remote-agent', spaceId: 'remote-workspace', model: 'remote-model' })
 
     await store.sendMessage('你是谁')
 
@@ -93,7 +93,7 @@ describe('chat store routing', () => {
     expect(mockedStartRunViaSocket.mock.calls[0][0]).toMatchObject({
       input: '你是谁',
       session_id: store.activeSessionId,
-      profile: 'hefeng',
+      profile: 'remote-agent',
       model: 'remote-model',
     })
   })
@@ -105,7 +105,7 @@ describe('chat store routing', () => {
     await store.sendMessage('本机会话第一条')
     const localSessionId = store.activeSessionId
 
-    store.setNextSessionGateway({ profile: 'hefeng', spaceId: 'hefeng-work', model: 'remote-model' })
+    store.setNextSessionGateway({ profile: 'remote-agent', spaceId: 'remote-workspace', model: 'remote-model' })
     await store.sendMessage('继续旧会话')
 
     expect(store.activeSession?.profile).toBe('default')
@@ -116,8 +116,8 @@ describe('chat store routing', () => {
   })
 
   it('restores the selected remote profile session after reload instead of falling back to default', async () => {
-    localStorage.setItem('hermes_next_session_profile', 'hefeng')
-    localStorage.setItem('hermes_active_session_hefeng', 'hefeng-old')
+    localStorage.setItem('hermes_next_session_profile', 'remote-agent')
+    localStorage.setItem('hermes_active_session_remote-agent', 'remote-old')
     localStorage.setItem('hermes_active_session_default', 'default-old')
     setActivePinia(createPinia())
 
@@ -144,11 +144,11 @@ describe('chat store routing', () => {
         cost_status: '',
       },
       {
-        id: 'hefeng-old',
-        profile: 'hefeng',
+        id: 'remote-old',
+        profile: 'remote-agent',
         source: 'api_server',
         model: 'gpt-5.5',
-        title: 'Hefeng chat',
+        title: 'Remote chat',
         started_at: 110,
         ended_at: null,
         last_active: 300,
@@ -169,42 +169,42 @@ describe('chat store routing', () => {
     const store = useChatStore()
     await store.loadSessions()
 
-    expect(store.activeSessionId).toBe('hefeng-old')
-    expect(store.activeSession?.profile).toBe('hefeng')
+    expect(store.activeSessionId).toBe('remote-old')
+    expect(store.activeSession?.profile).toBe('remote-agent')
   })
 
   it('keeps separate last-active session keys per gateway profile', async () => {
     mockedFetchSessions.mockResolvedValue([
       sessionSummary('default-old', 'default', 200),
-      sessionSummary('hefeng-old', 'hefeng', 300),
-      sessionSummary('minion-old', 'minion59', 250),
+      sessionSummary('remote-old', 'remote-agent', 300),
+      sessionSummary('minion-old', 'remote-peer', 250),
     ] as any)
 
     const store = useChatStore()
     await store.loadSessions()
-    await store.switchSession('hefeng-old')
+    await store.switchSession('remote-old')
     await store.switchSession('minion-old')
 
-    expect(localStorage.getItem('hermes_active_session_hefeng')).toBe('hefeng-old')
-    expect(localStorage.getItem('hermes_active_session_minion59')).toBe('minion-old')
+    expect(localStorage.getItem('hermes_active_session_remote-agent')).toBe('remote-old')
+    expect(localStorage.getItem('hermes_active_session_remote-peer')).toBe('minion-old')
     expect(localStorage.getItem('hermes_active_session_default')).toBe('default-old')
   })
 
   it('can switch immediately to the most recent session for the selected remote profile', async () => {
     mockedFetchSessions.mockResolvedValue([
       sessionSummary('default-old', 'default', 200),
-      sessionSummary('hefeng-old', 'hefeng', 300),
+      sessionSummary('remote-old', 'remote-agent', 300),
     ] as any)
 
     const store = useChatStore()
     await store.loadSessions()
-    store.setNextSessionGateway({ profile: 'hefeng', spaceId: 'hefeng-work' })
+    store.setNextSessionGateway({ profile: 'remote-agent', spaceId: 'remote-workspace' })
 
-    const switched = await store.switchToMostRecentSessionForProfile('hefeng')
+    const switched = await store.switchToMostRecentSessionForProfile('remote-agent')
 
     expect(switched).toBe(true)
-    expect(store.activeSessionId).toBe('hefeng-old')
-    expect(store.activeSession?.profile).toBe('hefeng')
+    expect(store.activeSessionId).toBe('remote-old')
+    expect(store.activeSession?.profile).toBe('remote-agent')
   })
 
 })

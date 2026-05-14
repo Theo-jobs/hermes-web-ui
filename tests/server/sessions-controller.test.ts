@@ -131,8 +131,8 @@ describe('session conversations controller', () => {
   it('lists all local-store sessions across profiles by default', async () => {
     useLocalSessionStoreMock.mockReturnValue(true)
     localListAllSessionsMock.mockReturnValue([
-      { id: 'hefeng-new', profile: 'hefeng', source: 'api_server', last_active: 30 },
-      { id: 'minion59-mid', profile: 'minion59', source: 'api_server', last_active: 20 },
+      { id: 'remote-new', profile: 'remote-agent', source: 'api_server', last_active: 30 },
+      { id: 'remote-peer-mid', profile: 'remote-peer', source: 'api_server', last_active: 20 },
       { id: 'default-old', profile: 'default', source: 'api_server', last_active: 10 },
     ])
 
@@ -142,23 +142,23 @@ describe('session conversations controller', () => {
 
     expect(localListAllSessionsMock).toHaveBeenCalledWith('api_server', 50)
     expect(localListSessionsMock).not.toHaveBeenCalled()
-    expect(ctx.body.sessions.map((s: any) => s.profile)).toEqual(['hefeng', 'minion59', 'default'])
+    expect(ctx.body.sessions.map((s: any) => s.profile)).toEqual(['remote-agent', 'remote-peer', 'default'])
   })
 
   it('lists only the requested profile in local-store mode when query.profile is explicit', async () => {
     useLocalSessionStoreMock.mockReturnValue(true)
     localListSessionsMock.mockReturnValue([
-      { id: 'hefeng-only', profile: 'hefeng', source: 'api_server', last_active: 30 },
+      { id: 'remote-only', profile: 'remote-agent', source: 'api_server', last_active: 30 },
     ])
 
     const mod = await import('../../packages/server/src/controllers/hermes/sessions')
-    const ctx: any = { query: { profile: ' hefeng ', limit: '2' }, body: null }
+    const ctx: any = { query: { profile: ' remote-agent ', limit: '2' }, body: null }
     await mod.list(ctx)
 
-    expect(localListSessionsMock).toHaveBeenCalledWith('hefeng', undefined, 2)
+    expect(localListSessionsMock).toHaveBeenCalledWith('remote-agent', undefined, 2)
     expect(localListAllSessionsMock).not.toHaveBeenCalled()
     expect(ctx.body.sessions).toEqual([
-      { id: 'hefeng-only', profile: 'hefeng', source: 'api_server', last_active: 30 },
+      { id: 'remote-only', profile: 'remote-agent', source: 'api_server', last_active: 30 },
     ])
   })
 

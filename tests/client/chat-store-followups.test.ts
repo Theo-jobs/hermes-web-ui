@@ -124,12 +124,12 @@ describe('chat store followups', () => {
     store.activeSession = draft
     store.activeSessionId = 'draft'
 
-    store.setNextSessionGateway({ profile: 'hefeng', spaceId: 'hefeng-work', model: 'remote-model' })
+    store.setNextSessionGateway({ profile: 'remote-agent', spaceId: 'remote-workspace', model: 'remote-model' })
 
-    expect(store.nextSessionProfile).toBe('hefeng')
-    expect(store.nextSessionSpaceId).toBe('hefeng-work')
-    expect(store.activeSession?.profile).toBe('hefeng')
-    expect(store.activeSession?.spaceId).toBe('hefeng-work')
+    expect(store.nextSessionProfile).toBe('remote-agent')
+    expect(store.nextSessionSpaceId).toBe('remote-workspace')
+    expect(store.activeSession?.profile).toBe('remote-agent')
+    expect(store.activeSession?.spaceId).toBe('remote-workspace')
     expect(store.activeSession?.model).toBe('remote-model')
 
     draft.messages.push({ id: 'u1', role: 'user', content: 'already sent', timestamp: 2 })
@@ -137,8 +137,8 @@ describe('chat store followups', () => {
 
     expect(store.nextSessionProfile).toBe('default')
     expect(store.nextSessionSpaceId).toBe('daily-mac')
-    expect(store.activeSession?.profile).toBe('hefeng')
-    expect(store.activeSession?.spaceId).toBe('hefeng-work')
+    expect(store.activeSession?.profile).toBe('remote-agent')
+    expect(store.activeSession?.spaceId).toBe('remote-workspace')
     expect(store.activeSession?.model).toBe('remote-model')
   })
 })

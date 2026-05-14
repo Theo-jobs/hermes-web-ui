@@ -18,10 +18,10 @@ describe('gateway registry service', () => {
     if (stateDir) rmSync(stateDir, { recursive: true, force: true })
   })
 
-  it('seeds local and Hefeng defaults from the remote agents env file', () => {
+  it('seeds local and remote agent defaults from the remote agents env file', () => {
     writeFileSync(join(stateDir, '.remote-agents.env'), [
-      'HEFENG_UPSTREAM=http://100.66.1.7:8642',
-      'HEFENG_API_SERVER_KEY=dummy-secret',
+      'REMOTE_AGENT_UPSTREAM=http://203.0.113.10:8642',
+      'REMOTE_AGENT_API_SERVER_KEY=dummy-secret',
       '',
     ].join('\n'), 'utf-8')
 
@@ -31,17 +31,17 @@ describe('gateway registry service', () => {
     expect(gateways).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'local-default', profile: 'default', type: 'local' }),
       expect.objectContaining({
-        id: 'hefeng',
-        profile: 'hefeng',
+        id: 'remote-agent',
+        profile: 'remote-agent',
         type: 'remote',
-        upstream: 'http://100.66.1.7:8642',
-        apiKeyEnv: 'HEFENG_API_SERVER_KEY',
+        upstream: 'http://203.0.113.10:8642',
+        apiKeyEnv: 'REMOTE_AGENT_API_SERVER_KEY',
         readonly: true,
       }),
     ]))
     expect(spaces).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'daily-mac', gatewayId: 'local-default', profile: 'default' }),
-      expect.objectContaining({ id: 'hefeng-work', gatewayId: 'hefeng', profile: 'hefeng' }),
+      expect.objectContaining({ id: 'remote-workspace', gatewayId: 'remote-agent', profile: 'remote-agent' }),
     ]))
   })
 

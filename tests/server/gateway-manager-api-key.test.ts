@@ -66,8 +66,8 @@ describe('GatewayManager API key routing', () => {
 
   it('keeps remote registry apiKeyEnv routing ahead of profile config', async () => {
     process.env.MINION59_API_SERVER_KEY = 'remote-env-key'
-    mkdirSync(join(hermesHome, 'profiles', 'minion59'), { recursive: true })
-    writeFileSync(join(hermesHome, 'profiles', 'minion59', 'config.yaml'), [
+    mkdirSync(join(hermesHome, 'profiles', 'remote-peer'), { recursive: true })
+    writeFileSync(join(hermesHome, 'profiles', 'remote-peer', 'config.yaml'), [
       'platforms:',
       '  api_server:',
       '    key: wrong-profile-key',
@@ -75,11 +75,11 @@ describe('GatewayManager API key routing', () => {
     ].join('\n'), 'utf-8')
     writeFileSync(join(stateDir, 'gateways.json'), JSON.stringify({
       gateways: [{
-        id: 'minion59',
-        profile: 'minion59',
+        id: 'remote-peer',
+        profile: 'remote-peer',
         type: 'remote',
         displayName: 'Minion59',
-        upstream: 'http://100.64.0.59:8642',
+        upstream: 'http://203.0.113.59:8642',
         apiKeyEnv: 'MINION59_API_SERVER_KEY',
       }],
     }), 'utf-8')
@@ -87,12 +87,12 @@ describe('GatewayManager API key routing', () => {
     const GatewayManager = await loadGatewayManager()
     const manager = new GatewayManager('default')
 
-    expect(manager.getApiKeyForUpstream('minion59')).toBe('remote-env-key')
+    expect(manager.getApiKeyForUpstream('remote-peer')).toBe('remote-env-key')
   })
 
   it('hydrates local gateway child env from profile .env without overriding exported env', async () => {
     writeFileSync(join(hermesHome, '.env'), [
-      'HERMES_NAS_API_KEY=profile-nas-key',
+      'REMOTE_GATEWAY_API_KEY=profile-nas-key',
       'EXPORTED_KEY=profile-should-not-win',
       'QUOTED_KEY="quoted-value"',
       'export EXPORTED_STYLE=from-profile',
@@ -105,7 +105,7 @@ describe('GatewayManager API key routing', () => {
       HERMES_HOME: '/old/home',
     })
 
-    expect(env.HERMES_NAS_API_KEY).toBe('profile-nas-key')
+    expect(env.REMOTE_GATEWAY_API_KEY).toBe('profile-nas-key')
     expect(env.EXPORTED_KEY).toBe('exported-wins')
     expect(env.QUOTED_KEY).toBe('quoted-value')
     expect(env.EXPORTED_STYLE).toBe('from-profile')

@@ -488,7 +488,7 @@ export const useChatStore = defineStore('chat', () => {
       sessions.value = fresh
 
       // Restore the active session for the selected next gateway/profile.
-      // EKKO chat can target remote profiles (hefeng/minion59) without changing
+      // EKKO chat can target remote profiles (remote-agent/remote-peer) without changing
       // the global Hermes profile selector, so getProfileName() alone would
       // restore the default/local chat after a refresh and make remote chats
       // appear to vanish. Keep a per-target active id and fall back to that

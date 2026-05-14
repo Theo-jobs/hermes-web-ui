@@ -166,17 +166,17 @@ function seedGateways(): GatewayRegistryEntry[] {
     },
   ]
 
-  const hefengUpstream = process.env.HEFENG_UPSTREAM || remoteEnv.HEFENG_UPSTREAM
-  const hefengKeyPresent = !!(process.env.HEFENG_API_SERVER_KEY || remoteEnv.HEFENG_API_SERVER_KEY)
-  if (hefengUpstream || hefengKeyPresent) {
+  const remoteAgentUpstream = process.env.REMOTE_AGENT_UPSTREAM || remoteEnv.REMOTE_AGENT_UPSTREAM
+  const remoteAgentKeyPresent = !!(process.env.REMOTE_AGENT_API_SERVER_KEY || remoteEnv.REMOTE_AGENT_API_SERVER_KEY)
+  if (remoteAgentUpstream || remoteAgentKeyPresent) {
     gateways.push({
-      id: 'hefeng',
-      profile: 'hefeng',
+      id: 'remote-agent',
+      profile: 'remote-agent',
       type: 'remote',
-      displayName: 'Hefeng remote',
-      upstream: hefengUpstream,
-      apiKeyEnv: 'HEFENG_API_SERVER_KEY',
-      spaceId: 'hefeng-work',
+      displayName: 'Remote agent',
+      upstream: remoteAgentUpstream,
+      apiKeyEnv: 'REMOTE_AGENT_API_SERVER_KEY',
+      spaceId: 'remote-workspace',
       readonly: true,
     })
   }
@@ -185,7 +185,7 @@ function seedGateways(): GatewayRegistryEntry[] {
 }
 
 function seedSpaces(gateways: GatewayRegistryEntry[]): SpaceRegistryEntry[] {
-  const hasHefeng = gateways.some(g => g.id === 'hefeng')
+  const hasRemoteAgent = gateways.some(g => g.id === 'remote-agent')
   const spaces: SpaceRegistryEntry[] = [
     {
       id: 'daily-mac',
@@ -194,12 +194,12 @@ function seedSpaces(gateways: GatewayRegistryEntry[]): SpaceRegistryEntry[] {
       profile: 'default',
     },
   ]
-  if (hasHefeng) {
+  if (hasRemoteAgent) {
     spaces.push({
-      id: 'hefeng-work',
-      displayName: 'Hefeng Work',
-      gatewayId: 'hefeng',
-      profile: 'hefeng',
+      id: 'remote-workspace',
+      displayName: 'Remote Workspace',
+      gatewayId: 'remote-agent',
+      profile: 'remote-agent',
     })
   }
   return spaces

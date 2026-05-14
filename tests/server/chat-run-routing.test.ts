@@ -48,18 +48,18 @@ describe('chat run routing', () => {
     const bound = resolveSessionBoundRunConfig(
       { profile: 'default', model: 'local-model', message_count: 0 },
       'default',
-      'hefeng',
+      'remote-agent',
       'remote-model',
     )
 
-    expect(bound).toEqual({ profile: 'hefeng', model: 'remote-model' })
+    expect(bound).toEqual({ profile: 'remote-agent', model: 'remote-model' })
   })
 
   it('keeps the persisted profile once the conversation has messages', () => {
     const bound = resolveSessionBoundRunConfig(
       { profile: 'default', model: 'local-model', message_count: 2 },
       'default',
-      'hefeng',
+      'remote-agent',
       undefined,
     )
 
