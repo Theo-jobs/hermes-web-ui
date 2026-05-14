@@ -921,9 +921,10 @@ async function handleWorkspaceConfirm() {
               secondary
               round
               class="followup-chip"
+              :title="suggestion"
               @click="chatStore.sendFollowup(suggestion)"
             >
-              {{ suggestion }}
+              <span class="followup-chip-text">{{ suggestion }}</span>
             </NButton>
           </template>
           <span v-else class="followup-error">追问暂不可用</span>
@@ -1370,7 +1371,7 @@ async function handleWorkspaceConfirm() {
 
 .followup-strip {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   flex-wrap: wrap;
   gap: 6px;
   padding: 8px 16px 4px;
@@ -1384,19 +1385,35 @@ async function handleWorkspaceConfirm() {
 .followup-error {
   font-size: 12px;
   color: $text-muted;
-  line-height: 22px;
+  line-height: 24px;
 }
 
 .followup-chip {
-  max-width: min(260px, 70vw);
-  overflow: hidden;
-  text-overflow: ellipsis;
+  max-width: min(520px, calc(100vw - 96px));
+  min-height: 24px;
+  height: auto;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  white-space: normal;
+  text-align: left;
+}
+
+.followup-chip-text {
+  display: inline-block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
 }
 
 @media (max-width: $breakpoint-mobile) {
   .followup-strip {
     padding: 6px 10px 3px;
     gap: 5px;
+  }
+
+  .followup-chip {
+    max-width: calc(100vw - 44px);
   }
 }
 
