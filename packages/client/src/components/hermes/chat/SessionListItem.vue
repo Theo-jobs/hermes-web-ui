@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onUnmounted } from 'vue'
+import { computed, onMounted, ref, onUnmounted } from 'vue'
 import { NPopconfirm, NCheckbox } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import type { Session } from '@/stores/hermes/chat'
+import { useGatewayRegistryStore } from '@/stores/hermes/gateway-registry'
 import { formatTimestampMs } from '@/shared/session-display'
 
 const props = defineProps<{
@@ -23,6 +24,8 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const gatewayRegistry = useGatewayRegistryStore()
+const gatewayLabel = computed(() => gatewayRegistry.labelForProfile(props.session.profile))
 
 let longPressTimer: ReturnType<typeof setTimeout> | null = null
 const longPressTriggered = ref(false)
@@ -66,6 +69,12 @@ function onClick() {
 onUnmounted(() => {
   if (longPressTimer) clearTimeout(longPressTimer)
 })
+
+onMounted(() => {
+  if (gatewayRegistry.gateways.length === 0 && !gatewayRegistry.loading) {
+    void gatewayRegistry.fetchAll()
+  }
+})
 </script>
 
 <template>
@@ -97,6 +106,7 @@ onUnmounted(() => {
         </span>
       </span>
       <span class="session-item-meta">
+        <span v-if="gatewayLabel" class="session-item-gateway">{{ gatewayLabel }}</span>
         <span v-if="session.model" class="session-item-model">{{ session.model }}</span>
         <span class="session-item-time">{{ formatTimestampMs(session.createdAt) }}</span>
       </span>

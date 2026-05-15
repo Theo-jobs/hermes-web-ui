@@ -16,6 +16,7 @@ export interface StartRunRequest {
   instructions?: string
   session_id?: string
   model?: string
+  profile?: string
   queue_id?: string
   source?: 'api_server' | 'cli'
 }
