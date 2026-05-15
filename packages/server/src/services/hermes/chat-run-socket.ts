@@ -219,6 +219,20 @@ interface BridgeCompressionResult {
   compressedStartIndex: number
 }
 
+export function resolveSessionBoundRunConfig(
+  session: { profile?: string | null; model?: string | null; message_count?: number | null } | null | undefined,
+  stateProfile: string | undefined,
+  requestedProfile: string | undefined,
+  requestedModel?: string,
+): { profile: string; model?: string } {
+  const fallbackProfile = session?.profile || stateProfile || 'default'
+  const hasPersistedMessages = typeof session?.message_count === 'number' && session.message_count > 0
+  return {
+    profile: hasPersistedMessages ? fallbackProfile : (requestedProfile || fallbackProfile),
+    model: requestedModel || session?.model || undefined,
+  }
+}
+
 // --- ChatRunSocket ---
 
 export class ChatRunSocket {
@@ -267,15 +281,20 @@ export class ChatRunSocket {
       queue_id?: string
       source?: string
     }) => {
+      const requestedProfile = currentProfile()
+      const bound = data.session_id
+        ? resolveSessionBoundRunConfig(getSession(data.session_id), this.sessionMap.get(data.session_id)?.profile, requestedProfile, data.model)
+        : { profile: requestedProfile, model: data.model }
+
       if (data.session_id) {
         const state = this.getOrCreateSession(data.session_id)
         if (state.isWorking) {
           state.queue.push({
             queue_id: data.queue_id || `queue_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
             input: data.input,
-            model: data.model,
+            model: bound.model,
             instructions: data.instructions,
-            profile: currentProfile(),
+            profile: bound.profile,
             source: this.resolveRunSource(data.source, data.session_id),
           })
           this.nsp.to(`session:${data.session_id}`).emit('run.queued', {
@@ -287,7 +306,7 @@ export class ChatRunSocket {
           return
         }
       }
-      await this.handleRun(socket, data, currentProfile())
+      await this.handleRun(socket, { ...data, model: bound.model }, bound.profile)
     })
 
     socket.on('cancel_queued_run', (data: { session_id?: string; queue_id?: string }) => {
@@ -568,7 +587,7 @@ export class ChatRunSocket {
     }
 
     const upstream = this.gatewayManager.getUpstream(profile).replace(/\/$/, '')
-    const apiKey = this.gatewayManager.getApiKey(profile) || undefined
+    const apiKey = (this.gatewayManager.getApiKeyForUpstream?.(profile) || this.gatewayManager.getApiKey(profile)) || undefined
 
     // Local marker used only to group in-memory messages for this streamed response.
     const runMarker = session_id
@@ -999,7 +1018,7 @@ export class ChatRunSocket {
     }
 
     const upstream = this.gatewayManager.getUpstream(profile).replace(/\/$/, '')
-    const apiKey = this.gatewayManager.getApiKey(profile) || undefined
+    const apiKey = (this.gatewayManager.getApiKeyForUpstream?.(profile) || this.gatewayManager.getApiKey(profile)) || undefined
     const totalTokens = countTokens(JSON.stringify(history))
     bridgeLogger.info({
       sessionId,
@@ -1134,7 +1153,7 @@ export class ChatRunSocket {
     const history = await this.buildCompressedHistory(
       session_id, profile,
       this.gatewayManager.getUpstream(profile).replace(/\/$/, ''),
-      this.gatewayManager.getApiKey(profile) || undefined,
+      (this.gatewayManager.getApiKeyForUpstream?.(profile) || this.gatewayManager.getApiKey(profile)) || undefined,
       emit,
     )
 

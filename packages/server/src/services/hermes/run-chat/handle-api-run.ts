@@ -97,7 +97,7 @@ export async function handleApiRun(
   }
 
   const upstream = gatewayManager.getUpstream(profile).replace(/\/$/, '')
-  const apiKey = gatewayManager.getApiKey(profile) || undefined
+  const apiKey = (gatewayManager.getApiKeyForUpstream?.(profile) || gatewayManager.getApiKey(profile)) || undefined
 
   const runMarker = session_id
     ? `resp_run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
