@@ -35,7 +35,8 @@
 这个仓库是 Theo / EKKO 自用的 Hermes Web UI 分支，当前 GitHub 默认展示分支为 `master`。
 
 - `master`：我们的长期使用分支，持续合并上游版本，并保留 Theo / EKKO 的本地增强。
-- `origin` 上游：`EKKOLearnAI/hermes-web-ui`，本次基线已合并到上游 `v0.5.25`。
+- `origin`：我们的 GitHub 仓库 `Theo-jobs/hermes-web-ui`，用于日常推送和默认展示。
+- `upstream`：上游仓库 `EKKOLearnAI/hermes-web-ui`，用于拉取上游更新；本次基线已合并到上游 `v0.5.25`。
 - `main`：仅保留为历史/兼容分支，不作为当前主要展示分支。
 
 ## 基于上游 v0.5.25 的更新
@@ -67,7 +68,7 @@
 
 ## 更新流程
 
-1. 从上游 `origin` 拉取最新提交和 tag。
+1. 从上游 `upstream` 拉取最新提交和 tag。
 2. 切到本仓库默认展示分支 `master`。
 3. 合并上游 release / `main`，保留 Theo / EKKO 本地补丁。
 4. 解决冲突后运行测试和构建。
