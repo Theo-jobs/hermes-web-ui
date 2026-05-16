@@ -36,6 +36,20 @@ export function resolveRunSource(source?: string, sessionId?: string): ChatRunSo
   return 'api_server'
 }
 
+export function resolveSessionBoundRunConfig(
+  session: { profile?: string | null; model?: string | null; message_count?: number | null } | null | undefined,
+  stateProfile: string | undefined,
+  requestedProfile: string | undefined,
+  requestedModel?: string,
+): { profile: string; model?: string } {
+  const fallbackProfile = session?.profile || stateProfile || 'default'
+  const hasPersistedMessages = typeof session?.message_count === 'number' && session.message_count > 0
+  return {
+    profile: hasPersistedMessages ? fallbackProfile : (requestedProfile || fallbackProfile),
+    model: requestedModel || session?.model || undefined,
+  }
+}
+
 export async function loadSessionStateFromDb(sid: string, _sessionMap: Map<string, SessionState>): Promise<SessionState> {
   try {
     const actualDetail = getSessionDetailPaginated(sid)

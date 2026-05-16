@@ -1,4 +1,4 @@
-import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
+import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
 import { generateFollowupSuggestions } from '@/api/hermes/followups'
 import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
 import { getApiKey } from '@/api/client'
@@ -47,6 +47,16 @@ export interface Message {
   // 不含 <think> 包裹标签；内容自身可以为多段纯文本。
   reasoning?: string
   queued?: boolean
+}
+
+export interface PendingApproval {
+  sessionId: string
+  approvalId: string
+  command: string
+  description: string
+  choices: Array<'once' | 'session' | 'always' | 'deny'>
+  allowPermanent: boolean
+  requestedAt: number
 }
 
 export interface Session {
@@ -400,6 +410,11 @@ export const useChatStore = defineStore('chat', () => {
   const queueLengths = ref<Map<string, number>>(new Map())
   /** sessionId → queued user messages not yet visible in the transcript */
   const queuedUserMessages = ref<Map<string, Message[]>>(new Map())
+  const pendingApprovals = ref<Map<string, PendingApproval>>(new Map())
+  const activePendingApproval = computed(() => {
+    const sid = activeSessionId.value
+    return sid ? pendingApprovals.value.get(sid) || null : null
+  })
 
   // 自动播放语音开关
   const autoPlaySpeechEnabled = ref(false)
@@ -551,6 +566,33 @@ export const useChatStore = defineStore('chat', () => {
     return session
   }
 
+  function newCliSession(): Session {
+    const now = new Date()
+    const ts = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+      '_',
+      String(now.getHours()).padStart(2, '0'),
+      String(now.getMinutes()).padStart(2, '0'),
+      String(now.getSeconds()).padStart(2, '0'),
+    ].join('')
+    const hex = Math.random().toString(16).slice(2, 8)
+    const session: Session = {
+      id: `${ts}_${hex}`,
+      title: '',
+      profile: nextSessionProfile.value || getProfileName(),
+      spaceId: nextSessionSpaceId.value,
+      source: 'cli',
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      model: nextSessionModel.value || undefined,
+    }
+    sessions.value.unshift(session)
+    return session
+  }
+
   function setNextSessionGateway(target: { profile: string; spaceId?: string | null; model?: string | null }) {
     const profile = target.profile || 'default'
     nextSessionProfile.value = profile
@@ -677,6 +719,10 @@ export const useChatStore = defineStore('chat', () => {
                 setAbortState({ aborting: true, synced: null })
               } else if (e.event === 'abort.completed') {
                 setAbortState({ aborting: false, synced: e.synced ?? false })
+              } else if (e.event === 'approval.requested') {
+                setPendingApproval({ ...e, session_id: sessionId } as RunEvent)
+              } else if (e.event === 'approval.resolved') {
+                clearPendingApproval({ ...e, session_id: sessionId } as RunEvent)
               }
             }
           }
@@ -837,6 +883,70 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function handleSessionCommandEvent(evt: RunEvent) {
+    const sid = evt.session_id
+    if (!sid) return
+    const target = sessions.value.find(s => s.id === sid)
+    const action = (evt as any).action as string | undefined
+
+    if (action === 'clear') {
+      if (target) target.messages = []
+      queuedUserMessages.value.delete(sid)
+      queueLengths.value.delete(sid)
+      if ((evt as any).clearHistory) {
+        const message = String((evt as any).message || '')
+        if (message) {
+          addMessage(sid, {
+            id: uid(),
+            role: 'command',
+            content: message,
+            timestamp: Date.now(),
+            systemType: (evt as any).ok === false ? 'error' : 'command',
+            commandAction: action,
+            commandData: { ...(evt as any) },
+          })
+        }
+      }
+      return
+    }
+
+    if (action === 'title' && target && typeof (evt as any).title === 'string') {
+      target.title = (evt as any).title
+      target.updatedAt = Date.now()
+    }
+
+    if (action === 'usage' && target) {
+      target.inputTokens = (evt as any).inputTokens
+      target.outputTokens = (evt as any).outputTokens
+    }
+
+    if (action === 'destroy') {
+      streamStates.value.delete(sid)
+      serverWorking.value.delete(sid)
+      queueLengths.value.delete(sid)
+      queuedUserMessages.value.delete(sid)
+      setAbortState(null)
+      const msgs = getSessionMsgs(sid)
+      msgs.forEach(m => {
+        if (m.isStreaming) updateMessage(sid, m.id, { isStreaming: false })
+        if (m.role === 'tool' && m.toolStatus === 'running') m.toolStatus = 'error'
+      })
+    }
+
+    const message = String((evt as any).message || '')
+    if (message) {
+      addMessage(sid, {
+        id: uid(),
+        role: 'command',
+        content: message,
+        timestamp: Date.now(),
+        systemType: (evt as any).ok === false ? 'error' : 'command',
+        commandAction: action,
+        commandData: { ...(evt as any) },
+      })
+    }
+  }
+
   function enqueueUserMessage(sessionId: string, message: Message) {
     const queue = queuedUserMessages.value.get(sessionId) || []
     queue.push({ ...message, queued: true })
@@ -857,6 +967,45 @@ export const useChatStore = defineStore('chat', () => {
       session_id: sessionId,
       queue_id: messageId,
     })
+  }
+
+  function setPendingApproval(evt: RunEvent) {
+    const sid = evt.session_id
+    const approvalId = (evt as any).approval_id as string | undefined
+    if (!sid || !approvalId) return
+    const rawChoices = Array.isArray((evt as any).choices) ? (evt as any).choices : ['once', 'session', 'deny']
+    const choices = rawChoices
+      .filter((choice: unknown): choice is PendingApproval['choices'][number] =>
+        choice === 'once' || choice === 'session' || choice === 'always' || choice === 'deny')
+    pendingApprovals.value.set(sid, {
+      sessionId: sid,
+      approvalId,
+      command: String((evt as any).command || ''),
+      description: String((evt as any).description || ''),
+      choices: choices.length ? choices : ['once', 'session', 'deny'],
+      allowPermanent: Boolean((evt as any).allow_permanent),
+      requestedAt: Date.now(),
+    })
+    pendingApprovals.value = new Map(pendingApprovals.value)
+  }
+
+  function clearPendingApproval(evt: RunEvent) {
+    const sid = evt.session_id
+    if (!sid) return
+    const current = pendingApprovals.value.get(sid)
+    if (!current) return
+    const approvalId = (evt as any).approval_id
+    if (approvalId && current.approvalId !== approvalId) return
+    pendingApprovals.value.delete(sid)
+    pendingApprovals.value = new Map(pendingApprovals.value)
+  }
+
+  function respondApproval(choice: PendingApproval['choices'][number]) {
+    const pending = activePendingApproval.value
+    if (!pending) return
+    respondToolApproval(pending.sessionId, pending.approvalId, choice)
+    pendingApprovals.value.delete(pending.sessionId)
+    pendingApprovals.value = new Map(pendingApprovals.value)
   }
 
   function showNextQueuedUserMessage(sessionId: string) {
@@ -1043,6 +1192,11 @@ export const useChatStore = defineStore('chat', () => {
 
             case 'run.queued': {
               queueLengths.value.set(sid, (evt as any).queue_length || 0)
+              break
+            }
+
+            case 'session.command': {
+              handleSessionCommandEvent(evt)
               break
             }
 
@@ -1236,6 +1390,16 @@ export const useChatStore = defineStore('chat', () => {
                 })
               }
 
+              break
+            }
+
+            case 'approval.requested': {
+              setPendingApproval(evt)
+              break
+            }
+
+            case 'approval.resolved': {
+              clearPendingApproval(evt)
               break
             }
 
@@ -1476,6 +1640,11 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
+        case 'session.command': {
+          handleSessionCommandEvent(evt)
+          break
+        }
+
         case 'run.started':
           setAbortState(null)
           runProducedAssistantText = false
@@ -1670,6 +1839,16 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
+        case 'approval.requested': {
+          setPendingApproval(evt)
+          break
+        }
+
+        case 'approval.resolved': {
+          clearPendingApproval(evt)
+          break
+        }
+
         case 'run.completed': {
           const hasQueue = (evt as any).queue_remaining > 0
           if (hasQueue) {
@@ -1822,7 +2001,10 @@ export const useChatStore = defineStore('chat', () => {
       onAbortStarted: (evt) => handleEvent(evt),
       onAbortCompleted: (evt) => handleEvent(evt),
       onUsageUpdated: (evt) => handleEvent(evt),
+      onSessionCommand: (evt) => handleEvent(evt),
       onRunQueued: (evt) => handleEvent(evt),
+      onApprovalRequested: (evt) => handleEvent(evt),
+      onApprovalResolved: (evt) => handleEvent(evt),
     })
 
     // No need to emit resume here — switchSession already did it.
@@ -1983,12 +2165,15 @@ export const useChatStore = defineStore('chat', () => {
     refreshFollowups,
     queueLengths,
     queuedUserMessages,
+    pendingApprovals,
+    activePendingApproval,
     removeQueuedMessage,
     isLoadingSessions,
     sessionsLoaded,
     isLoadingMessages,
 
     newChat,
+    newCliSession,
     setNextSessionGateway,
     switchToMostRecentSessionForProfile,
     switchSession,
@@ -1998,6 +2183,7 @@ export const useChatStore = defineStore('chat', () => {
     deleteSession,
     sendMessage,
     stopStreaming,
+    respondApproval,
     loadSessions,
     refreshActiveSession,
     getThinkingObservation,

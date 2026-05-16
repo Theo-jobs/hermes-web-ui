@@ -41,7 +41,7 @@ vi.mock('../../packages/server/src/db/hermes/usage-store', () => ({
   updateUsage: vi.fn(),
 }))
 
-import { resolveSessionBoundRunConfig } from '../../packages/server/src/services/hermes/chat-run-socket'
+import { resolveSessionBoundRunConfig } from '../../packages/server/src/services/hermes/run-chat/handle-api-run'
 
 describe('chat run routing', () => {
   it('lets the requested profile bind the first run of an empty persisted draft session', () => {

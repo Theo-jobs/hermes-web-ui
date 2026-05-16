@@ -301,8 +301,39 @@ const activeModelLabel = computed(
   () => chatStore.activeSession?.model || appStore.selectedModel || "default",
 );
 
+const activeApproval = computed(() => chatStore.activePendingApproval);
+const visibleApproval = computed(() => activeApproval.value);
+
 function handleNewChat() {
   chatStore.newChat();
+}
+
+function handleNewCliChat() {
+  const session = chatStore.newCliSession();
+  chatStore.switchSession(session.id);
+}
+
+const newChatOptions = computed(() => [
+  {
+    label: "API",
+    key: "api_server",
+  },
+  {
+    label: "Bridge (beta)",
+    key: "cli",
+  },
+]);
+
+function handleNewChatSelect(key: string | number) {
+  if (key === "cli") {
+    handleNewCliChat();
+    return;
+  }
+  handleNewChat();
+}
+
+function handleApproval(choice: "once" | "session" | "always" | "deny") {
+  chatStore.respondApproval(choice);
 }
 
 async function copySessionId(id?: string) {
@@ -653,21 +684,27 @@ async function handleWorkspaceConfirm() {
               </svg>
             </template>
           </NButton>
-          <NButton quaternary size="tiny" @click="handleNewChat" circle>
-            <template #icon>
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-              >
-                <line x1="12" y1="5" x2="12" y2="19" />
-                <line x1="5" y1="12" x2="19" y2="12" />
-              </svg>
-            </template>
-          </NButton>
+          <NDropdown
+            trigger="click"
+            :options="newChatOptions"
+            @select="handleNewChatSelect"
+          >
+            <NButton quaternary size="tiny" circle>
+              <template #icon>
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </template>
+            </NButton>
+          </NDropdown>
         </div>
       </div>
       <div v-if="showSessions" class="session-scope-note">
@@ -885,28 +922,94 @@ async function handleWorkspaceConfirm() {
               </template>
               {{ t("chat.copySessionId") }}
             </NTooltip>
-            <NButton size="small" :circle="isMobile" @click="handleNewChat">
-              <template #icon>
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                >
-                  <line x1="12" y1="5" x2="12" y2="19" />
-                  <line x1="5" y1="12" x2="19" y2="12" />
-                </svg>
-              </template>
-              <template v-if="!isMobile">{{ t("chat.newChat") }}</template>
-            </NButton>
+            <NDropdown
+              trigger="click"
+              :options="newChatOptions"
+              @select="handleNewChatSelect"
+            >
+              <NButton size="small" :circle="isMobile">
+                <template #icon>
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <line x1="12" y1="5" x2="12" y2="19" />
+                    <line x1="5" y1="12" x2="19" y2="12" />
+                  </svg>
+                </template>
+                <template v-if="!isMobile">{{ t("chat.newChat") }}</template>
+              </NButton>
+            </NDropdown>
           </template>
         </div>
       </header>
 
       <template v-if="currentMode === 'chat'">
         <MessageList />
+        <div v-if="visibleApproval" class="approval-bar">
+          <div class="approval-icon" aria-hidden="true">
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
+              <path d="m9 12 2 2 4-4" />
+            </svg>
+          </div>
+          <div class="approval-content">
+            <div class="approval-main">
+              <div class="approval-kicker">{{ t("chat.approvalKicker") }}</div>
+              <div class="approval-title">{{ t("chat.approvalTitle") }}</div>
+              <div class="approval-desc">{{ visibleApproval.description }}</div>
+              <code class="approval-command">{{ visibleApproval.command }}</code>
+            </div>
+            <div class="approval-actions">
+              <NButton
+                v-if="visibleApproval.choices.includes('once')"
+                size="small"
+                type="primary"
+                @click="handleApproval('once')"
+              >
+                {{ t("chat.approvalAllowOnce") }}
+              </NButton>
+              <NButton
+                v-if="visibleApproval.choices.includes('session')"
+                size="small"
+                secondary
+                @click="handleApproval('session')"
+              >
+                {{ t("chat.approvalAllowSession") }}
+              </NButton>
+              <NButton
+                v-if="visibleApproval.choices.includes('always')"
+                size="small"
+                secondary
+                @click="handleApproval('always')"
+              >
+                {{ t("chat.approvalAlways") }}
+              </NButton>
+              <NButton
+                v-if="visibleApproval.choices.includes('deny')"
+                size="small"
+                type="error"
+                secondary
+                @click="handleApproval('deny')"
+              >
+                {{ t("chat.approvalDeny") }}
+              </NButton>
+            </div>
+          </div>
+        </div>
         <div
           v-if="chatStore.followupLoading || chatStore.followupSuggestions.length > 0 || (chatStore.followupError && chatStore.followupSuggestions.length === 0)"
           class="followup-strip"
@@ -1503,6 +1606,122 @@ async function handleWorkspaceConfirm() {
 
   &:hover {
     transform: scale(1.1);
+  }
+}
+
+.approval-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 16px 12px;
+  padding: 12px;
+  border: 1px solid $border-color;
+  border-radius: 8px;
+  background: $bg-card;
+  box-shadow: none;
+}
+
+.approval-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  color: var(--accent-primary);
+  background: rgba(var(--accent-primary-rgb), 0.12);
+  border: 1px solid rgba(var(--accent-primary-rgb), 0.2);
+  border-radius: 8px;
+}
+
+.approval-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.approval-main {
+  min-width: 0;
+}
+
+.approval-kicker {
+  margin-bottom: 2px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-primary);
+}
+
+.approval-title {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: $text-primary;
+}
+
+.approval-desc {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: $text-secondary;
+}
+
+.approval-command {
+  display: block;
+  margin-top: 8px;
+  max-height: 96px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: $text-primary;
+  background: $bg-secondary;
+  border: 1px solid $border-color;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid $border-color;
+}
+
+@media (max-width: 768px) {
+  .approval-bar {
+    margin: 0 10px 10px;
+    padding: 10px;
+  }
+
+  .approval-icon {
+    flex-basis: 28px;
+    width: 28px;
+    height: 28px;
+  }
+
+  .approval-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .approval-actions :deep(.n-button) {
+    width: 100%;
+  }
+}
+
+@media (max-width: 420px) {
+  .approval-bar {
+    gap: 8px;
+  }
+
+  .approval-actions {
+    grid-template-columns: 1fr;
   }
 }
 

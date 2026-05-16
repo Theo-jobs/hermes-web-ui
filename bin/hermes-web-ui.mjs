@@ -11,7 +11,10 @@ const serverEntry = resolve(__dirname, '..', 'dist', 'server', 'index.js')
 const pkgDir = resolve(__dirname, '..')
 const pkg = JSON.parse(readFileSync(resolve(pkgDir, 'package.json'), 'utf-8'))
 const VERSION = pkg.version
-const PID_DIR = resolve(homedir(), '.hermes-web-ui')
+const WEB_UI_HOME = process.env.HERMES_WEB_UI_HOME?.trim()
+  ? resolve(process.env.HERMES_WEB_UI_HOME.trim())
+  : resolve(homedir(), '.hermes-web-ui')
+const PID_DIR = WEB_UI_HOME
 const PID_FILE = join(PID_DIR, 'server.pid')
 const LOG_FILE = join(PID_DIR, 'server.log')
 const TOKEN_FILE = join(PID_DIR, '.token')
@@ -434,6 +437,7 @@ Commands:
   restart [port]     Restart the server
   status             Show server status
   update             Update to latest version and restart
+  upgrade            Alias for update
   version            Show version number
 
 Options:
@@ -447,7 +451,22 @@ Options:
 function doUpdate() {
   console.log('  ⬆ Updating hermes-web-ui...')
 
-  const child = spawnCli(getNpmBin(), ['install', '-g', 'hermes-web-ui@latest'], {
+  const npm = getNpmBin()
+  try {
+    console.log('  🧹 Cleaning npm cache...')
+    execFileSync(npm, ['cache', 'clean', '--force'], {
+      stdio: 'inherit',
+      env: getCurrentNodeEnv(),
+    })
+  } catch (err) {
+    console.log(`  ⚠ Failed to clean npm cache, continuing update: ${err?.message || err}`)
+  }
+
+  runUpdateInstall(npm)
+}
+
+function runUpdateInstall(npm) {
+  const child = spawnCli(npm, ['install', '-g', 'hermes-web-ui@latest'], {
     stdio: 'inherit',
     windowsHide: true,
     env: getCurrentNodeEnv(),

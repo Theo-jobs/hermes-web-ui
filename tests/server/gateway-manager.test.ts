@@ -114,7 +114,7 @@ describe('GatewayManager gateway process env', () => {
     expect(env.HERMES_HOME).toBe(home)
   })
 
-  it('removes parent env keys defined by any profile env for non-default profile gateways', async () => {
+  it('removes parent env keys shadowed by profile env while preserving the selected profile values', async () => {
     const home = createHermesHome()
     const workHome = join(home, 'profiles', 'work')
     mkdirSync(workHome, { recursive: true })
@@ -163,8 +163,8 @@ describe('GatewayManager gateway process env', () => {
     expect(env.WECOM_SECRET).toBeUndefined()
     expect(env.FUTURE_PLATFORM_TOKEN).toBeUndefined()
     expect(env.EXPORTED_SECRET).toBeUndefined()
-    expect(env.WORK_ONLY_TOKEN).toBeUndefined()
-    expect(env.PARENT_OVERRIDE_ME).toBeUndefined()
+    expect(env.WORK_ONLY_TOKEN).toBe('work-profile')
+    expect(env.PARENT_OVERRIDE_ME).toBe('work-profile')
     expect(env.COMMENTED_OUT_SECRET).toBeUndefined()
     expect(env.UNKNOWN_SERVICE_TOKEN).toBe('keep-me')
     expect(env.CUSTOM_GATEWAY_SETTING).toBe('from-parent')

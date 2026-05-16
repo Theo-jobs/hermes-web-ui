@@ -14,7 +14,7 @@ import { getSystemPrompt } from '../../../lib/llm-prompt'
 import { getSession } from '../../../db/hermes/session-store'
 import { getActiveProfileName } from '../hermes-profile'
 import { AgentBridgeClient } from '../agent-bridge'
-import { handleApiRun, resolveRunSource, loadSessionStateFromDb } from './handle-api-run'
+import { handleApiRun, resolveRunSource, loadSessionStateFromDb, resolveSessionBoundRunConfig } from './handle-api-run'
 import { handleBridgeRun } from './handle-bridge-run'
 import { handleAbort } from './abort'
 import { getOrCreateSession } from './compression'
@@ -69,6 +69,16 @@ export class ChatRunSocket {
       queue_id?: string
       source?: string
     }) => {
+      const requestedProfile = currentProfile()
+      const bound = data.session_id
+        ? resolveSessionBoundRunConfig(
+          getSession(data.session_id),
+          this.sessionMap.get(data.session_id)?.profile,
+          requestedProfile,
+          data.model,
+        )
+        : { profile: requestedProfile, model: data.model }
+
       if (data.session_id) {
         const state = getOrCreateSession(this.sessionMap, data.session_id)
         const source = resolveRunSource(data.source, data.session_id)
@@ -81,8 +91,8 @@ export class ChatRunSocket {
               sessionMap: this.sessionMap,
               bridge: this.bridge,
               gatewayManager: this.gatewayManager,
-              profile: currentProfile(),
-              model: data.model,
+              profile: bound.profile,
+              model: bound.model,
               instructions: data.instructions,
               runQueuedItem: this.runQueuedItem.bind(this),
             })
@@ -101,9 +111,9 @@ export class ChatRunSocket {
           state.queue.push({
             queue_id: data.queue_id || `queue_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
             input: data.input,
-            model: data.model,
+            model: bound.model,
             instructions: data.instructions,
-            profile: currentProfile(),
+            profile: bound.profile,
             source,
           })
           this.nsp.to(`session:${data.session_id}`).emit('run.queued', {
@@ -115,11 +125,11 @@ export class ChatRunSocket {
           return
         }
         state.isWorking = true
-        state.profile = currentProfile()
+        state.profile = bound.profile
         state.source = source
       }
       try {
-        await this.handleRun(socket, data, currentProfile())
+        await this.handleRun(socket, { ...data, model: bound.model }, bound.profile)
       } catch (err) {
         if (data.session_id) {
           const state = this.sessionMap.get(data.session_id)
