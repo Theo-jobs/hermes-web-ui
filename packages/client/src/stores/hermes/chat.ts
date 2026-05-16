@@ -1179,6 +1179,7 @@ export const useChatStore = defineStore('chat', () => {
           switch (evt.event) {
             case 'run.started':
               setAbortState(null)
+              setCompressionState(null)
               runProducedAssistantText = false
               runHadToolActivity = false
               closeStreamingAssistant()
@@ -1647,6 +1648,7 @@ export const useChatStore = defineStore('chat', () => {
 
         case 'run.started':
           setAbortState(null)
+          setCompressionState(null)
           runProducedAssistantText = false
           runHadToolActivity = false
           closeStreamingAssistant()
