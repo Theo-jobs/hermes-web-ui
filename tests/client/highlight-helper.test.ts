@@ -5,7 +5,6 @@ const highlightJsMock = vi.hoisted(() => ({
   highlight: vi.fn((content: string, { language }: { language: string }) => ({
     value: `<span class="mock-${language}">${content}</span>`,
   })),
-  registerLanguage: vi.fn(),
 }))
 
 vi.mock('highlight.js', () => ({

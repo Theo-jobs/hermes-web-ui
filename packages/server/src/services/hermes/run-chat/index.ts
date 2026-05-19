@@ -14,7 +14,7 @@ import { getSystemPrompt } from '../../../lib/llm-prompt'
 import { getSession } from '../../../db/hermes/session-store'
 import { getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from '../hermes-profile'
 import { AgentBridgeClient } from '../agent-bridge'
-import { handleApiRun, resolveRunSource, loadSessionStateFromDb } from './handle-api-run'
+import { handleApiRun, resolveRunSource, loadSessionStateFromDb, resolveSessionBoundRunConfig } from './handle-api-run'
 import { handleBridgeRun } from './handle-bridge-run'
 import { handleAbort } from './abort'
 import { getOrCreateSession } from './compression'
@@ -81,7 +81,16 @@ export class ChatRunSocket {
       source?: string
       profile?: string
     }) => {
-      const runProfile = resolveRunProfile(data.session_id, data.profile)
+      const requestedProfile = resolveRunProfile(data.session_id, data.profile)
+      const bound = data.session_id
+        ? resolveSessionBoundRunConfig(
+          getSession(data.session_id),
+          this.sessionMap.get(data.session_id)?.profile,
+          requestedProfile,
+          data.model,
+        )
+        : { profile: requestedProfile, model: data.model }
+      const runProfile = bound.profile
       if (data.session_id) {
         const state = getOrCreateSession(this.sessionMap, data.session_id)
         const source = resolveRunSource(data.source, data.session_id)
@@ -94,7 +103,7 @@ export class ChatRunSocket {
               sessionMap: this.sessionMap,
               bridge: this.bridge,
               profile: runProfile,
-              model: data.model,
+              model: bound.model,
               instructions: data.instructions,
               runQueuedItem: this.runQueuedItem.bind(this),
             })
@@ -113,7 +122,7 @@ export class ChatRunSocket {
           state.queue.push({
             queue_id: data.queue_id || `queue_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
             input: data.input,
-            model: data.model,
+            model: bound.model,
             provider: data.provider,
             model_groups: data.model_groups,
             instructions: data.instructions,
@@ -133,7 +142,7 @@ export class ChatRunSocket {
         state.source = source
       }
       try {
-        await this.handleRun(socket, data, runProfile)
+        await this.handleRun(socket, { ...data, model: bound.model }, runProfile)
       } catch (err) {
         if (data.session_id) {
           const state = this.sessionMap.get(data.session_id)

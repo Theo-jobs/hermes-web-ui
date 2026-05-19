@@ -16,6 +16,7 @@ export interface StartRunRequest {
   instructions?: string
   session_id?: string
   model?: string
+  profile?: string
   provider?: string
   model_groups?: Array<{ provider: string; models: string[] }>
   queue_id?: string

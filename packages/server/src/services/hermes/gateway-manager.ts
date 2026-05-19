@@ -28,7 +28,8 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process'
-import { join } from 'path'
+import { join, resolve } from 'path'
+import { homedir } from 'os'
 import { readFileSync, existsSync, readdirSync, unlinkSync } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -36,6 +37,7 @@ import { createServer } from 'net'
 import yaml from 'js-yaml'
 import { logger } from '../logger'
 import { detectHermesHome, getHermesBin } from './hermes-path'
+import { gatewayRegistryService } from './gateway-registry'
 
 const execFileAsync = promisify(execFile)
 
@@ -79,6 +81,34 @@ function parseEnvKeys(raw: string): Set<string> {
   return keys
 }
 
+function parseEnvValues(raw: string): Record<string, string> {
+  const values: Record<string, string> = {}
+  for (const line of raw.split(/\r?\n/)) {
+    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+    if (!match) continue
+    values[match[1]] = match[2].trim().replace(/^['"]|['"]$/g, '')
+  }
+  return values
+}
+
+function readEnvFile(path: string): string {
+  try {
+    return existsSync(path) ? readFileSync(path, 'utf-8') : ''
+  } catch {
+    return ''
+  }
+}
+
+function resolveEnvRefValue(value: string, envContent = ''): string {
+  const trimmed = String(value || '').trim().replace(/^['"]|['"]$/g, '')
+  const match = trimmed.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/)
+  if (!match) return trimmed
+  const key = match[1]
+  if (process.env[key]) return process.env[key] || ''
+  const envMatch = envContent.match(new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=\\s*(.+)`, 'm'))
+  return envMatch?.[1]?.trim().replace(/^['"]|['"]$/g, '') || ''
+}
+
 function readProfileEnvKeys(): Set<string> {
   const keys = new Set<string>()
   const envPaths = [join(HERMES_BASE, '.env')]
@@ -99,6 +129,15 @@ function readProfileEnvKeys(): Set<string> {
   return keys
 }
 
+export function buildGatewayChildEnv(hermesHome: string, baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const profileEnv = parseEnvValues(readEnvFile(join(hermesHome, '.env')))
+  return {
+    ...profileEnv,
+    ...baseEnv,
+    HERMES_HOME: hermesHome,
+  }
+}
+
 export function buildGatewayProcessEnv(profileName: string, hermesHome: string): NodeJS.ProcessEnv {
   const base = { ...process.env }
 
@@ -108,10 +147,7 @@ export function buildGatewayProcessEnv(profileName: string, hermesHome: string):
     }
   }
 
-  return {
-    ...base,
-    HERMES_HOME: hermesHome,
-  }
+  return buildGatewayChildEnv(hermesHome, base)
 }
 
 function getWebUiPort(): number | null {
@@ -399,6 +435,8 @@ export class GatewayManager {
   /** 获取指定 profile 的网关 URL（代理路由使用） */
   getUpstream(profileName?: string): string {
     const name = profileName || this.activeProfile
+    const registryGateway = this.getRegistryGateway(name)
+    if (registryGateway?.upstream) return registryGateway.upstream
     const gw = this.gateways.get(name)
     if (gw?.url) return gw.url
     const { port, host } = this.readProfilePort(name)
@@ -413,10 +451,74 @@ export class GatewayManager {
       if (!existsSync(envPath)) return null
       const content = readFileSync(envPath, 'utf-8')
       const match = content.match(/^API_SERVER_KEY\s*=\s*"?([^"\n]+)"?/m)
-      return match?.[1]?.trim() || null
+      const value = match?.[1]?.trim() || ''
+      return this.resolveEnvRef(value, content) || null
     } catch {
       return null
     }
+  }
+
+  /** 读取 profile 配置、registry 或 env 里的 API key，兼容远端 gateway。 */
+  getApiKeyForUpstream(profileName?: string): string | null {
+    const name = profileName || this.activeProfile
+    try {
+      const profileDir = this.profileDir(name)
+      const configPath = join(profileDir, 'config.yaml')
+      const stateDir = resolve(process.env.HERMES_WEB_UI_STATE_DIR || process.env.HERMES_WEB_UI_DATA_DIR || join(homedir(), '.hermes-web-ui'))
+      const remoteEnvPath = join(stateDir, '.remote-agents.env')
+      const envContent = [
+        readEnvFile(join(profileDir, '.env')),
+        readEnvFile(remoteEnvPath),
+      ].join('\n')
+
+      const registryGateway = this.getRegistryGateway(name)
+      if (registryGateway?.apiKeyEnv) {
+        const key = this.resolveEnvRef(`\${${registryGateway.apiKeyEnv}}`, envContent)
+        if (key) return key
+      }
+
+      if (existsSync(configPath)) {
+        const cfg = yaml.load(readFileSync(configPath, 'utf-8')) as any || {}
+        const upstream = this.getUpstream(name).replace(/\/+$/, '')
+        const apiServer = cfg?.platforms?.api_server
+        const byApiServerKey = this.resolveEnvRef(String(apiServer?.extra?.key || apiServer?.key || ''), envContent)
+        if (byApiServerKey) return byApiServerKey
+
+        const providers = Array.isArray(cfg.custom_providers) ? cfg.custom_providers : []
+        for (const cp of providers) {
+          const cpBase = String(cp?.base_url || '').replace(/\/+$/, '')
+          if (cpBase && cpBase === upstream) {
+            const byEnvName = String(cp?.apiKeyEnv || cp?.api_key_env || '').trim()
+            if (byEnvName) {
+              const byEnv = this.resolveEnvRef(`\${${byEnvName}}`, envContent)
+              if (byEnv) return byEnv
+            }
+            const byApiKey = this.resolveEnvRef(String(cp?.api_key || cp?.apiKey || ''), envContent)
+            if (byApiKey) return byApiKey
+          }
+        }
+      }
+
+      const fallbackName = `${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_SERVER_KEY`
+      const fallbackKey = this.resolveEnvRef(`\${${fallbackName}}`, envContent)
+      const apiServerKey = this.resolveEnvRef('${API_SERVER_KEY}', envContent)
+      return fallbackKey || apiServerKey || this.getApiKey(name)
+    } catch {
+      return this.getApiKey(name)
+    }
+  }
+
+  private getRegistryGateway(profileName: string): any | null {
+    try {
+      return gatewayRegistryService.listGateways()
+        .find((gateway: any) => gateway.profile === profileName || gateway.id === profileName) || null
+    } catch {
+      return null
+    }
+  }
+
+  private resolveEnvRef(value: string, envContent = ''): string {
+    return resolveEnvRefValue(value, envContent)
   }
 
   getActiveProfile(): string {
@@ -483,6 +585,15 @@ export class GatewayManager {
 
     // 首先检查 PID 文件：如果存在且进程存活且健康，则标记为运行
     if (pid && this.isProcessAlive(pid) && await this.checkHealth(url)) {
+      if (isLocalHost(host)) {
+        const listeningPids = await this.getListeningPids(port)
+        if (listeningPids.length > 0 && !listeningPids.includes(pid)) {
+          diagnostics.health_ok = false
+          diagnostics.reason = 'pid alive but configured port belongs to another process'
+          this.gateways.delete(name)
+          return { profile: name, port, host, url, running: false, diagnostics }
+        }
+      }
       diagnostics.health_ok = true
       diagnostics.reason = 'pid alive and health check passed'
       this.gateways.set(name, { pid, port, host, url, owned: false })
@@ -503,7 +614,15 @@ export class GatewayManager {
 
   /** 检测所有 profile 的网关状态 */
   async listAll(): Promise<GatewayStatus[]> {
-    const profiles = await this.listProfiles()
+    const allProfiles = await this.listProfiles()
+    const managedProfiles = new Set(
+      gatewayRegistryService.listGateways()
+        .filter((gateway: any) => gateway.type !== 'remote')
+        .map((gateway: any) => gateway.profile),
+    )
+    const profiles = managedProfiles.size
+      ? allProfiles.filter(name => managedProfiles.has(name))
+      : allProfiles
     const statuses = await Promise.all(profiles.map(name => this.detectStatus(name)))
     return statuses
   }

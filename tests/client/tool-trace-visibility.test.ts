@@ -115,4 +115,37 @@ describe('tool trace visibility', () => {
       'assistant-1',
     ])
   })
+
+  it('disables browser scroll anchoring and pins long live chats to the bottom during tool updates', async () => {
+    const originalRaf = window.requestAnimationFrame
+    window.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+      cb(Date.now())
+      return 1
+    }) as typeof window.requestAnimationFrame
+
+    try {
+      const wrapper = mountLiveList()
+      const list = wrapper.find('.message-list').element as HTMLElement
+      Object.defineProperty(list, 'clientHeight', { configurable: true, value: 100 })
+      Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 1200 })
+      list.scrollTop = 1100
+
+      const chatStore = useChatStore()
+      chatStore.activeSession!.messages.push({
+        id: 'tool-live',
+        role: 'tool',
+        content: '',
+        timestamp: 5,
+        toolName: 'terminal',
+        toolPreview: 'running build',
+        toolStatus: 'running',
+      })
+      await wrapper.vm.$nextTick()
+
+      expect(wrapper.find('.message-list').classes()).toContain('message-list')
+      expect(list.scrollTop).toBe(1100)
+    } finally {
+      window.requestAnimationFrame = originalRaf
+    }
+  })
 })

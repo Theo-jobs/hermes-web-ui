@@ -3,6 +3,7 @@ import { renameSession, setSessionWorkspace, batchDeleteSessions, exportSession 
 import { useChatStore, type Session } from "@/stores/hermes/chat";
 import { useAppStore } from "@/stores/hermes/app";
 import { useProfilesStore } from "@/stores/hermes/profiles";
+import { useGatewayRegistryStore } from "@/stores/hermes/gateway-registry";
 import { useSessionBrowserPrefsStore } from "@/stores/hermes/session-browser-prefs";
 import {
   NButton,
@@ -18,6 +19,7 @@ import {
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { copyToClipboard } from "@/utils/clipboard";
+import { filterSessionsForProfileWithFallback } from "./session-profile-filter";
 import FolderPicker from "./FolderPicker.vue";
 import ChatInput from "./ChatInput.vue";
 import ConversationMonitorPane from "./ConversationMonitorPane.vue";
@@ -29,6 +31,7 @@ import OutlinePanel from "./OutlinePanel.vue";
 const chatStore = useChatStore();
 const appStore = useAppStore();
 const profilesStore = useProfilesStore();
+const gatewayRegistry = useGatewayRegistryStore();
 const sessionBrowserPrefsStore = useSessionBrowserPrefsStore();
 const message = useMessage();
 const { t } = useI18n();
@@ -77,6 +80,9 @@ onMounted(() => {
   if (profilesStore.profiles.length === 0) {
     void profilesStore.fetchProfiles();
   }
+  if (gatewayRegistry.gateways.length === 0 && !gatewayRegistry.loading) {
+    void gatewayRegistry.fetchAll();
+  }
 });
 
 onUnmounted(() => {
@@ -106,9 +112,16 @@ function sortSessionsWithActiveFirst(items: Session[]): Session[] {
   });
 }
 
+const visibleSessions = computed(() =>
+  filterSessionsForProfileWithFallback(
+    chatStore.sessions,
+    chatStore.nextSessionProfile,
+  ),
+);
+
 const pinnedSessions = computed(() =>
   sortSessionsWithActiveFirst(
-    chatStore.sessions.filter((session) =>
+    visibleSessions.value.filter((session) =>
       sessionBrowserPrefsStore.isPinned(session.id),
     ),
   ),
@@ -116,7 +129,7 @@ const pinnedSessions = computed(() =>
 
 const unpinnedSessions = computed(() =>
   sortSessionsWithActiveFirst(
-    chatStore.sessions.filter(
+    visibleSessions.value.filter(
       (session) => !sessionBrowserPrefsStore.isPinned(session.id),
     ),
   ),
@@ -143,6 +156,89 @@ const headerTitle = computed(() =>
   currentMode.value === "live"
     ? t("chat.liveSessions")
     : activeSessionTitle.value,
+);
+
+
+const gatewayById = computed(() => {
+  const map = new Map<string, (typeof gatewayRegistry.gateways)[number]>();
+  for (const gateway of gatewayRegistry.gateways) map.set(gateway.id, gateway);
+  return map;
+});
+
+const gatewayByProfile = computed(() => {
+  const map = new Map<string, (typeof gatewayRegistry.gateways)[number]>();
+  for (const gateway of gatewayRegistry.gateways) map.set(gateway.profile, gateway);
+  return map;
+});
+
+const spaceByProfile = computed(() => {
+  const map = new Map<string, (typeof gatewayRegistry.spaces)[number]>();
+  for (const space of gatewayRegistry.spaces) {
+    if (!map.has(space.profile)) map.set(space.profile, space);
+  }
+  return map;
+});
+
+const gatewayTargetOptions = computed(() => {
+  const seen = new Set<string>();
+  const options = gatewayRegistry.spaces.map((space) => {
+    seen.add(space.profile);
+    const gateway = gatewayById.value.get(space.gatewayId);
+    return {
+      label: `${space.displayName} / ${gateway?.displayName || space.profile}`,
+      value: space.id,
+    };
+  });
+  for (const gateway of gatewayRegistry.gateways) {
+    if (seen.has(gateway.profile)) continue;
+    options.push({
+      label: `${gateway.displayName || gateway.id} / ${gateway.profile}`,
+      value: `profile:${gateway.profile}`,
+    });
+  }
+  return options;
+});
+
+const selectedGatewayTarget = computed({
+  get() {
+    return (
+      chatStore.nextSessionSpaceId ||
+      `profile:${chatStore.nextSessionProfile || "default"}`
+    );
+  },
+  set(value: string) {
+    const space = gatewayRegistry.spaces.find((item) => item.id === value);
+    const profile = space?.profile || value.replace(/^profile:/, "") || "default";
+    const gateway = gatewayByProfile.value.get(profile);
+    chatStore.setNextSessionGateway({
+      profile,
+      spaceId: space?.id || null,
+      model: gateway?.defaultModel || null,
+    });
+    void chatStore.switchToMostRecentSessionForProfile(profile);
+  },
+});
+
+const activeGateway = computed(() =>
+  gatewayByProfile.value.get(chatStore.activeSession?.profile || ""),
+);
+
+const activeSpace = computed(() => {
+  const session = chatStore.activeSession;
+  if (!session) return null;
+  if (session.spaceId) {
+    const exact = gatewayRegistry.spaces.find((space) => space.id === session.spaceId);
+    if (exact) return exact;
+  }
+  return spaceByProfile.value.get(session.profile || "") || null;
+});
+
+const activeModelLabel = computed(
+  () => chatStore.activeSession?.model || appStore.selectedModel || "default",
+);
+
+const activeSessionSource = computed(() =>
+  currentMode.value === "chat" ? chatStore.activeSession?.source || "" : "",
 );
 
 const activeApproval = computed(() => chatStore.activePendingApproval);
@@ -1036,6 +1132,10 @@ async function handleSessionModelCustomSubmit() {
             </template>
           </NButton>
           <span class="header-session-title">{{ headerTitle }}</span>
+          <span v-if="activeSessionSource" class="source-badge">{{ activeSessionSource }}</span>
+          <span v-if="activeSpace" class="session-meta-badge">Space: {{ activeSpace.displayName }}</span>
+          <span v-if="chatStore.activeSession" class="session-meta-badge">Gateway: {{ activeGateway?.displayName || chatStore.activeSession.profile || "default" }}</span>
+          <span v-if="chatStore.activeSession" class="session-meta-badge">Model: {{ activeModelLabel }}</span>
           <span
             v-if="chatStore.activeSession?.workspace"
             class="workspace-badge"
@@ -1050,6 +1150,18 @@ async function handleSessionModelCustomSubmit() {
         <div class="header-actions">
           <!-- chat/live mode toggle hidden -->
           <template v-if="currentMode === 'chat'">
+            <div class="gateway-target-control">
+              <span class="gateway-target-label">Next chat</span>
+              <NSelect
+                v-model:value="selectedGatewayTarget"
+                size="small"
+                :options="gatewayTargetOptions"
+                :loading="gatewayRegistry.loading"
+                :disabled="gatewayTargetOptions.length === 0"
+                :consistent-menu-width="false"
+                class="gateway-target-select"
+              />
+            </div>
             <NTooltip trigger="hover">
               <template #trigger>
                 <NButton
@@ -1187,6 +1299,28 @@ async function handleSessionModelCustomSubmit() {
               </NButton>
             </div>
           </div>
+        </div>
+        <div
+          v-if="chatStore.followupLoading || chatStore.followupSuggestions.length > 0 || (chatStore.followupError && chatStore.followupSuggestions.length === 0)"
+          class="followup-strip"
+        >
+          <span class="followup-label">可以继续：</span>
+          <span v-if="chatStore.followupLoading" class="followup-loading">生成追问中…</span>
+          <template v-else-if="chatStore.followupSuggestions.length > 0">
+            <NButton
+              v-for="suggestion in chatStore.followupSuggestions"
+              :key="suggestion"
+              size="tiny"
+              secondary
+              round
+              class="followup-chip"
+              :title="suggestion"
+              @click="chatStore.sendFollowup(suggestion)"
+            >
+              <span class="followup-chip-text">{{ suggestion }}</span>
+            </NButton>
+          </template>
+          <span v-else class="followup-error">追问暂不可用</span>
         </div>
         <ChatInput />
       </template>
@@ -1746,6 +1880,7 @@ async function handleSessionModelCustomSubmit() {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 21px 20px;
   border-bottom: 1px solid $border-color;
   flex-shrink: 0;
@@ -1780,11 +1915,44 @@ async function handleSessionModelCustomSubmit() {
   line-height: 16px;
 }
 
+.session-meta-badge {
+  font-size: 10px;
+  color: $text-secondary;
+  background: rgba(var(--accent-primary-rgb), 0.08);
+  border: 1px solid rgba(var(--accent-primary-rgb), 0.12);
+  padding: 1px 7px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  line-height: 16px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .header-actions {
   display: flex;
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+}
+
+.gateway-target-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+}
+
+.gateway-target-label {
+  color: $text-muted;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.gateway-target-select {
+  width: 230px;
 }
 
 .chat-mode-toggle {
@@ -1794,9 +1962,81 @@ async function handleSessionModelCustomSubmit() {
   margin-right: 4px;
 }
 
+.followup-strip {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 16px 4px;
+  border-top: 1px solid rgba($border-color, 0.5);
+  background: rgba($bg-card, 0.58);
+  flex-shrink: 0;
+}
+
+.followup-label,
+.followup-loading,
+.followup-error {
+  font-size: 12px;
+  color: $text-muted;
+  line-height: 24px;
+}
+
+.followup-chip {
+  max-width: min(520px, calc(100vw - 96px));
+  min-height: 24px;
+  height: auto;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  white-space: normal;
+  text-align: left;
+}
+
+.followup-chip-text {
+  display: inline-block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+@media (max-width: $breakpoint-mobile) {
+  .followup-strip {
+    padding: 6px 10px 3px;
+    gap: 5px;
+  }
+
+  .followup-chip {
+    max-width: calc(100vw - 44px);
+  }
+}
+
 @media (max-width: $breakpoint-mobile) {
   .chat-header {
-    padding: 16px 12px 16px 52px;
+    align-items: flex-start;
+    padding: 12px 12px 12px 52px;
+    flex-direction: column;
+  }
+
+  .header-left,
+  .header-actions {
+    width: 100%;
+  }
+
+  .header-left {
+    flex-wrap: wrap;
+  }
+
+  .header-actions {
+    justify-content: flex-end;
+  }
+
+  .gateway-target-control {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .gateway-target-select {
+    width: 100%;
   }
 }
 

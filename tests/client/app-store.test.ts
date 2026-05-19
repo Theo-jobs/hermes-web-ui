@@ -228,6 +228,7 @@ describe('App Store', () => {
     expect(store.displayModelName('unknown', 'deepseek')).toBe('unknown')
   })
 
+
   it('does not refetch available models within the cache window after an empty response', async () => {
     mockSystemApi.fetchAvailableModels.mockResolvedValue({
       default: '',

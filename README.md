@@ -1,12 +1,13 @@
 <p align="center">
   <strong>Hermes Web UI</strong>
-  <a href="./README_zh.md">中文</a>
+  <br/>
+  <span>基于上游 v0.5.25 的 Theo / EKKO 本地增强版</span>
 </p>
 
 <p align="center">
-  A full-featured web dashboard for <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a>.<br/>
-  Manage AI chat sessions, monitor usage & costs, configure platform channels,<br/>
-  schedule cron jobs, browse skills — all from a clean, responsive web interface.
+  <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a> 的全功能 Web 管理面板。<br/>
+  管理 AI 聊天会话、监控用量与成本、配置平台渠道、<br/>
+  管理定时任务、浏览技能 —— 全部在一个简洁响应式的 Web 界面中完成。
 </p>
 
 <p align="center">

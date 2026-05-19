@@ -5,6 +5,7 @@ import { useAppStore } from '@/stores/hermes/app'
 import { useProfilesStore } from '@/stores/hermes/profiles'
 import { fetchContextLength } from '@/api/hermes/sessions'
 import { setModelContext } from '@/api/hermes/model-context'
+import { transcribeAudio } from '@/api/hermes/stt'
 import { NButton, NTooltip, NSwitch, NModal, NInputNumber, useMessage } from 'naive-ui'
 import { computed, ref, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -22,6 +23,18 @@ const attachments = ref<Attachment[]>([])
 const isDragging = ref(false)
 const dragCounter = ref(0)
 const isComposing = ref(false)
+const isRecording = ref(false)
+const isTranscribing = ref(false)
+const mediaRecorder = ref<MediaRecorder | null>(null)
+const recordingStream = ref<MediaStream | null>(null)
+const recordedChunks = ref<Blob[]>([])
+const voiceInputMode = ref(false)
+const voiceTranscriptPreview = ref('')
+const voiceStatusText = computed(() => {
+  if (isRecording.value) return '松开转文字'
+  if (isTranscribing.value) return '识别中...'
+  return voiceTranscriptPreview.value || '按住说话，松开转文字'
+})
 
 const bridgeCommands = computed(() => [
   { name: 'usage', args: '', description: t('chat.slashCommands.usage') },
@@ -406,6 +419,185 @@ function formatSize(bytes: number): string {
 function isImage(type: string): boolean {
   return type.startsWith('image/')
 }
+
+// --- Browser voice input ---
+
+const holdStarted = ref(false)
+let recordingStartedAt = 0
+let fallbackStopTimer: ReturnType<typeof setTimeout> | null = null
+
+const micDisabled = computed(() =>
+  isTranscribing.value ||
+  !navigator.mediaDevices?.getUserMedia ||
+  typeof MediaRecorder === 'undefined',
+)
+
+function getRecordingMimeType(): string {
+  const supportedTypes = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+  ]
+  try {
+    return supportedTypes.find(type => MediaRecorder.isTypeSupported(type)) || ''
+  } catch {
+    return ''
+  }
+}
+
+function recordingExtension(mimeType: string): string {
+  if (mimeType.includes('mp4')) return 'm4a'
+  if (mimeType.includes('wav')) return 'wav'
+  if (mimeType.includes('ogg')) return 'ogg'
+  return 'webm'
+}
+
+function microphoneErrorMessage(err: any): string {
+  const raw = String(err?.message || err?.name || '')
+  if (/AVAudioSessionCaptureDevice|Requested device not found|NotFoundError/i.test(raw)) {
+    return '没有可用麦克风。请检查浏览器/系统麦克风权限，或换 Safari/Chrome 后刷新再试。'
+  }
+  if (/NotAllowedError|Permission denied/i.test(raw)) {
+    return '麦克风权限被拒绝。请在浏览器地址栏/系统设置里允许麦克风。'
+  }
+  if (/NotReadableError|TrackStartError/i.test(raw)) {
+    return '麦克风正被其他应用占用，关闭占用录音的应用后再试。'
+  }
+  return raw || 'Microphone access failed'
+}
+
+async function startRecording() {
+  if (micDisabled.value || isRecording.value) return
+
+  try {
+    voiceTranscriptPreview.value = ''
+    recordedChunks.value = []
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const mimeType = getRecordingMimeType()
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+
+    recordingStream.value = stream
+    mediaRecorder.value = recorder
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) recordedChunks.value.push(event.data)
+    }
+    recorder.onerror = (event: any) => {
+      message.error(microphoneErrorMessage(event?.error || event))
+      stopRecording(true)
+    }
+    recorder.onstop = () => {
+      void handleRecordingStopped(mimeType || recorder.mimeType)
+    }
+
+    recorder.start(250)
+    recordingStartedAt = Date.now()
+    isRecording.value = true
+  } catch (err: any) {
+    cleanupRecording()
+    message.error(microphoneErrorMessage(err))
+  }
+}
+
+function stopRecording(cancel = false) {
+  if (fallbackStopTimer) {
+    clearTimeout(fallbackStopTimer)
+    fallbackStopTimer = null
+  }
+  holdStarted.value = false
+  if (!isRecording.value || !mediaRecorder.value) return
+  if (cancel) recordedChunks.value = []
+  try {
+    if (mediaRecorder.value.state !== 'inactive') mediaRecorder.value.stop()
+  } catch {
+    cleanupRecording()
+    isRecording.value = false
+  }
+}
+
+async function handleMicPress(e?: Event) {
+  e?.preventDefault()
+  if (micDisabled.value) return
+  holdStarted.value = true
+  await startRecording()
+}
+
+function handleMicRelease(e?: Event) {
+  e?.preventDefault()
+  if (!holdStarted.value && !isRecording.value) return
+  const elapsed = Date.now() - recordingStartedAt
+  if (elapsed < 300) {
+    fallbackStopTimer = setTimeout(() => stopRecording(), 300 - elapsed)
+    return
+  }
+  stopRecording()
+}
+
+function handleMicCancel() {
+  stopRecording(true)
+}
+
+function toggleVoiceInputMode() {
+  if (isRecording.value) {
+    stopRecording(true)
+  }
+  voiceInputMode.value = !voiceInputMode.value
+  slashActive.value = false
+  if (!voiceInputMode.value) {
+    nextTick(() => textareaRef.value?.focus())
+  }
+}
+
+async function handleRecordingStopped(mimeType: string) {
+  isRecording.value = false
+  const chunks = recordedChunks.value
+  cleanupRecording()
+  if (!chunks.length) return
+
+  isTranscribing.value = true
+  try {
+    const type = mimeType || 'audio/webm'
+    const audio = new Blob(chunks, { type })
+    const result = await transcribeAudio(audio, `recording-${Date.now()}.${recordingExtension(type)}`)
+    const transcript = result.transcript.trim()
+    if (transcript) {
+      inputText.value = inputText.value
+        ? `${inputText.value}${inputText.value.endsWith(' ') ? '' : ' '}${transcript}`
+        : transcript
+      voiceTranscriptPreview.value = `已识别：${transcript}`
+      message.success('已转成文字，确认后可发送')
+      voiceInputMode.value = false
+      await nextTick()
+      await resizeTextarea()
+      updateSlashState()
+      textareaRef.value?.focus()
+    } else {
+      voiceTranscriptPreview.value = '没有识别到语音，请再按住说一遍'
+      message.warning('没有识别到语音')
+    }
+  } catch (err: any) {
+    message.error(err?.message || 'Transcription failed')
+  } finally {
+    isTranscribing.value = false
+  }
+}
+
+function cleanupRecording() {
+  recordingStream.value?.getTracks().forEach(track => track.stop())
+  recordingStream.value = null
+  mediaRecorder.value = null
+}
+
+async function resizeTextarea() {
+  await new Promise(resolve => requestAnimationFrame(resolve))
+  if (!textareaRef.value || textareaHeight.value !== null) return
+  textareaRef.value.style.height = 'auto'
+  textareaRef.value.style.height = Math.min(textareaRef.value.scrollHeight, 100) + 'px'
+}
+
+onUnmounted(() => {
+  stopRecording(true)
+  cleanupRecording()
+})
 </script>
 
 <template>
@@ -524,6 +716,7 @@ function isImage(type: string): boolean {
       />
       <div class="resize-handle" @mousedown="startResize"></div>
       <textarea
+        v-if="!voiceInputMode"
         ref="textareaRef"
         v-model="inputText"
         class="input-textarea"
@@ -536,6 +729,24 @@ function isImage(type: string): boolean {
         @input="handleInput"
         @paste="handlePaste"
       ></textarea>
+      <button
+        v-else
+        type="button"
+        class="voice-hold-button"
+        :class="{ recording: isRecording, transcribing: isTranscribing }"
+        :disabled="micDisabled"
+        @pointerdown="handleMicPress"
+        @pointerup="handleMicRelease"
+        @pointerleave="handleMicRelease"
+        @pointercancel="handleMicCancel"
+        @contextmenu.prevent
+      >
+        <span class="voice-hold-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+        </span>
+        <span class="voice-hold-main">{{ isRecording ? '松开转文字' : isTranscribing ? '识别中...' : '按住说话' }}</span>
+        <span class="voice-hold-sub">{{ voiceStatusText }}</span>
+      </button>
       <Transition name="dropdown-fade">
         <div
           v-if="slashActive && filteredBridgeCommands.length > 0"
@@ -557,6 +768,26 @@ function isImage(type: string): boolean {
         </div>
       </Transition>
       <div class="input-actions">
+        <NTooltip trigger="hover">
+          <template #trigger>
+            <NButton
+              size="small"
+              quaternary
+              circle
+              :type="voiceInputMode ? 'primary' : 'default'"
+              :class="{ 'mic-recording': isRecording }"
+              :disabled="isTranscribing"
+              :loading="isTranscribing"
+              @click="toggleVoiceInputMode"
+            >
+              <template #icon>
+                <svg v-if="voiceInputMode" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>
+                <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+              </template>
+            </NButton>
+          </template>
+          {{ voiceInputMode ? '切回文字输入' : '切到语音输入' }}
+        </NTooltip>
         <NButton
           v-if="chatStore.isStreaming"
           size="small"
@@ -883,11 +1114,91 @@ function isImage(type: string): boolean {
   }
 }
 
+.voice-hold-button {
+  flex: 1;
+  min-height: 44px;
+  border: 1px solid $border-color;
+  border-radius: 999px;
+  background: $bg-secondary;
+  color: $text-primary;
+  font-family: $font-ui;
+  font-size: 15px;
+  font-weight: 600;
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  justify-content: center;
+  column-gap: 8px;
+  row-gap: 1px;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  transition: transform $transition-fast, background-color $transition-fast, border-color $transition-fast, color $transition-fast;
+
+  &:hover:not(:disabled) {
+    border-color: $accent-primary;
+    background: rgba(var(--accent-primary-rgb), 0.08);
+  }
+
+  &:active:not(:disabled),
+  &.recording {
+    transform: scale(0.985);
+    color: #e5484d;
+    border-color: rgba(229, 72, 77, 0.45);
+    background: rgba(229, 72, 77, 0.12);
+    animation: mic-pulse 1s ease-in-out infinite;
+  }
+
+  &.transcribing,
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.72;
+  }
+
+  .dark & {
+    background-color: #2b2b2b;
+  }
+}
+
+.voice-hold-icon {
+  display: inline-flex;
+  align-items: center;
+  grid-row: 1 / span 2;
+}
+
+.voice-hold-main {
+  line-height: 1.15;
+}
+
+.voice-hold-sub {
+  color: $text-muted;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.2;
+  max-width: min(360px, 50vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .input-actions {
   display: flex;
   gap: 6px;
   flex-shrink: 0;
   align-items: center;
+}
+
+.mic-recording {
+  color: #e5484d;
+  background: rgba(229, 72, 77, 0.12);
+  animation: mic-pulse 1s ease-in-out infinite;
+}
+
+@keyframes mic-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
 }
 
 .slash-command-dropdown {

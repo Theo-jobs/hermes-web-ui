@@ -22,6 +22,7 @@ import { homedir } from 'os'
  * Runtime behavior:
  * - PROFILE: Initial Hermes profile name. Default: default.
  * - GATEWAY_HOST: Default gateway host written into profile config. Default: 127.0.0.1.
+ * - SESSION_STORE: Session source, local SQLite or remote Hermes CLI. Default: local.
  * - HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN: Whether Web UI shutdown also stops gateways.
  * - WORKSPACE_BASE: Base directory for workspace browsing. Default: /opt/data/workspace.
  *
@@ -52,4 +53,6 @@ export const config = {
   uploadDir: process.env.UPLOAD_DIR || join(appHome, 'upload'),
   dataDir: resolve(__dirname, '..', 'data'),
   corsOrigins: process.env.CORS_ORIGINS || '*',
+  /** Session store: 'local' (self-built SQLite) or 'remote' (Hermes CLI) */
+  sessionStore: (process.env.SESSION_STORE || 'local') as 'local' | 'remote',
 }

@@ -37,6 +37,29 @@
 
 ---
 
+## EKKO fork 分支
+
+这个 fork 保持 `main` 跟随上游项目，`master` 作为 EKKO 补丁的长期分支。
+
+更新流程：
+
+1. 拉取上游 `main`。
+2. 切到 `master`。
+3. 合并或 rebase 最新上游 `main`。
+4. 解决冲突、跑测试，然后推送 `master`。
+
+### EKKO 分支新增内容
+
+- Gateway registry 与 workspace 路由：用 JSON registry 管理本地或远端 Hermes gateway，新会话可选择目标 workspace，密钥只引用环境变量名，不保存原始值。
+- 远端会话连续性：按 profile/workspace 记住最近活跃会话，刷新后不自动退回默认 profile。
+- Follow-up 建议：助手回复后展示上下文后续问题建议，较长建议支持自动换行。
+- Kanban 看板：在 Web UI 里创建和管理 Hermes 任务，包含看板、卡片、详情抽屉、事件和 API。
+- 模型管理增强：provider preset、可见模型配置、模型别名、上下文长度设置。
+- 用量与 skills 监控：更完整的 token/成本视图、cache 指标、每日趋势和 skill usage 统计。
+- 语音与播放设置：TTS provider 设置、完成提示音控制、语音输入支持。
+- 插件与 gateway 页面：只读插件可见性，以及 gateway 运行状态和 registry 视图。
+- Website/docs 包：随 dashboard 一起维护 landing/docs 站点构建。
+
 ## 功能特性
 
 ### AI 聊天

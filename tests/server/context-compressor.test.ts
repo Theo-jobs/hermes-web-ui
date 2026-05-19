@@ -46,8 +46,8 @@ describe('ChatContextCompressor', () => {
     global.fetch = originalFetch
   })
 
-  it('keeps full history when full summarization fails', async () => {
-    const { ChatContextCompressor } = await import('../../packages/server/src/lib/context-compressor')
+  it('uses deterministic fallback when full summarization fails', async () => {
+    const { ChatContextCompressor, SUMMARY_PREFIX } = await import('../../packages/server/src/lib/context-compressor')
     const compressor = new ChatContextCompressor({ config: { tailMessageCount: 3 } })
     const messages = Array.from({ length: 8 }, (_, i) => ({
       role: i % 2 === 0 ? 'user' : 'assistant',
@@ -58,14 +58,19 @@ describe('ChatContextCompressor', () => {
 
     const result = await compressor.compress(messages, 'http://upstream', undefined, 's1')
 
-    expect(result.messages).toHaveLength(messages.length)
-    expect(result.messages.map(m => m.content)).toEqual(messages.map(m => m.content))
-    expect(result.meta.compressed).toBe(false)
+    expect(result.messages).toHaveLength(4)
+    expect(result.messages[0].content).toContain(SUMMARY_PREFIX)
+    expect(result.messages.slice(1).map(m => m.content)).toEqual(['message 5', 'message 6', 'message 7'])
+    expect(result.meta.compressed).toBe(true)
     expect(result.meta.llmCompressed).toBe(false)
-    expect(saveCompressionSnapshotMock).not.toHaveBeenCalled()
+    expect(result.meta.compressedStartIndex).toBe(4)
+    expect(result.meta.verbatimCount).toBe(3)
+    expect(result.meta.skippedReason).toBe('deterministic_fallback_after_summarization_failed')
+    expect(saveCompressionSnapshotMock).toHaveBeenCalledTimes(1)
+    expect(saveCompressionSnapshotMock).toHaveBeenCalledWith('s1', expect.any(String), 4, 8)
   })
 
-  it('keeps all new messages when incremental summarization fails', async () => {
+  it('rolls forward a deterministic fallback snapshot when incremental summarization fails', async () => {
     const { ChatContextCompressor, SUMMARY_PREFIX } = await import('../../packages/server/src/lib/context-compressor')
     const compressor = new ChatContextCompressor({ config: { tailMessageCount: 3 } })
     const messages = Array.from({ length: 8 }, (_, i) => ({
@@ -81,17 +86,17 @@ describe('ChatContextCompressor', () => {
 
     const result = await compressor.compress(messages, 'http://upstream', undefined, 's1')
 
-    expect(result.messages).toHaveLength(7)
-    expect(result.messages[0]).toEqual({
-      role: 'user',
-      content: `${SUMMARY_PREFIX}\n\nprevious summary`,
-    })
-    expect(result.messages.slice(1).map(m => m.content)).toEqual(messages.slice(2).map(m => m.content))
+    expect(result.messages).toHaveLength(4)
+    expect(result.messages[0].content).toContain(SUMMARY_PREFIX)
+    expect(result.messages[0].content).toContain('message 4')
+    expect(result.messages.slice(1).map(m => m.content)).toEqual(['message 5', 'message 6', 'message 7'])
     expect(result.meta.compressed).toBe(true)
     expect(result.meta.llmCompressed).toBe(false)
-    expect(result.meta.compressedStartIndex).toBe(1)
-    expect(result.meta.verbatimCount).toBe(6)
-    expect(saveCompressionSnapshotMock).not.toHaveBeenCalled()
+    expect(result.meta.compressedStartIndex).toBe(4)
+    expect(result.meta.verbatimCount).toBe(3)
+    expect(result.meta.skippedReason).toBe('deterministic_incremental_fallback_after_summarization_failed')
+    expect(saveCompressionSnapshotMock).toHaveBeenCalledTimes(1)
+    expect(saveCompressionSnapshotMock).toHaveBeenCalledWith('s1', expect.any(String), 4, 8)
   })
 
   it('does not call the summarizer when snapshot has only tail messages after it', async () => {

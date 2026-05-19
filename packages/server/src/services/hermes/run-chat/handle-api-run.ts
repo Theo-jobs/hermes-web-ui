@@ -23,10 +23,25 @@ import { calcAndUpdateUsage, estimateUsageTokensFromMessages } from './usage'
 import { handleMessage } from './message-format'
 import { countTokens, SUMMARY_PREFIX } from '../../../lib/context-compressor'
 import { getCompressionSnapshot } from '../../../db/hermes/compression-snapshot'
+import { getGatewayManagerInstance } from '../../gateway-bootstrap'
 import type { ContentBlock, SessionState, ChatRunSource } from './types'
 
-export function resolveRunSource(_source?: string, _sessionId?: string): ChatRunSource {
-  return 'cli'
+export function resolveRunSource(source?: string, _sessionId?: string): ChatRunSource {
+  return source === 'api_server' ? 'api_server' : 'cli'
+}
+
+export function resolveSessionBoundRunConfig(
+  session: { profile?: string | null; model?: string | null; message_count?: number | null } | null | undefined,
+  stateProfile: string | undefined,
+  requestedProfile: string | undefined,
+  requestedModel?: string,
+): { profile: string; model?: string } {
+  const fallbackProfile = session?.profile || stateProfile || 'default'
+  const hasPersistedMessages = typeof session?.message_count === 'number' && session.message_count > 0
+  return {
+    profile: hasPersistedMessages ? fallbackProfile : (requestedProfile || fallbackProfile),
+    model: requestedModel || session?.model || undefined,
+  }
 }
 
 export async function loadSessionStateFromDb(sid: string, _sessionMap: Map<string, SessionState>): Promise<SessionState> {
@@ -88,8 +103,9 @@ export async function handleApiRun(
     }
   }
 
-  const upstream = ''
-  const apiKey = undefined
+  const gatewayManager = getGatewayManagerInstance()
+  const upstream = gatewayManager?.getUpstream(profile).replace(/\/$/, '') || ''
+  const apiKey = (gatewayManager?.getApiKeyForUpstream?.(profile) || gatewayManager?.getApiKey(profile) || undefined)
 
   const runMarker = session_id
     ? `resp_run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`

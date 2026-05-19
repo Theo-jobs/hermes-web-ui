@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, ref, onUnmounted } from 'vue'
+import { computed, onMounted, ref, onUnmounted } from 'vue'
 import { NPopconfirm, NCheckbox } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import multiavatar from '@multiavatar/multiavatar'
 import type { Session } from '@/stores/hermes/chat'
+import { useGatewayRegistryStore } from '@/stores/hermes/gateway-registry'
 import { useAppStore } from '@/stores/hermes/app'
 import { formatTimestampMs } from '@/shared/session-display'
 
@@ -28,6 +29,8 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const gatewayRegistry = useGatewayRegistryStore()
+const gatewayLabel = computed(() => gatewayRegistry.labelForProfile(props.session.profile))
 const appStore = useAppStore()
 const sessionModelName = computed(() =>
   props.session.model
@@ -79,6 +82,12 @@ function onClick() {
 onUnmounted(() => {
   if (longPressTimer) clearTimeout(longPressTimer)
 })
+
+onMounted(() => {
+  if (gatewayRegistry.gateways.length === 0 && !gatewayRegistry.loading) {
+    void gatewayRegistry.fetchAll()
+  }
+})
 </script>
 
 <template>
@@ -110,6 +119,7 @@ onUnmounted(() => {
         </span>
       </span>
       <span class="session-item-meta">
+        <span v-if="gatewayLabel" class="session-item-gateway">{{ gatewayLabel }}</span>
         <span v-if="sessionModelName" class="session-item-model" :title="session.model">{{ sessionModelName }}</span>
         <span class="session-item-time">{{ formatTimestampMs(session.createdAt) }}</span>
       </span>

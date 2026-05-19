@@ -91,9 +91,26 @@ function isNearBottom(threshold = 200): boolean {
 
 function scrollToBottom() {
   nextTick(() => {
-    if (listRef.value) {
-      listRef.value.scrollTop = listRef.value.scrollHeight;
-    }
+    const el = listRef.value;
+    if (!el) return;
+
+    // Tool-call rows, spinners, and the thinking video can change height across
+    // multiple layout frames. Pin to the actual maximum scroll offset now and
+    // again after the browser has applied the layout, otherwise Chrome scroll
+    // anchoring can keep an older anchor and visibly jump long chats upward.
+    const raf = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : (cb: FrameRequestCallback) => window.setTimeout(() => cb(Date.now()), 0);
+    const pin = () => {
+      const target = Math.max(0, el.scrollHeight - el.clientHeight);
+      el.scrollTop = target;
+    };
+
+    pin();
+    raf(() => {
+      pin();
+      raf(pin);
+    });
   });
 }
 
@@ -375,6 +392,7 @@ watch(currentToolCalls, () => {
 .message-list {
   flex: 1;
   overflow-y: auto;
+  overflow-anchor: none;
   padding: 20px;
   display: flex;
   flex-direction: column;
