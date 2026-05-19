@@ -5,13 +5,17 @@ const getConversationDetailFromDbMock = vi.fn()
 const listConversationSummariesMock = vi.fn()
 const getConversationDetailMock = vi.fn()
 const getSessionDetailFromDbMock = vi.fn()
+const getExactSessionDetailFromDbWithProfileMock = vi.fn()
 const getUsageStatsFromDbMock = vi.fn()
 const getSessionMock = vi.fn()
+const deleteHermesSessionForProfileMock = vi.fn()
 const localListSessionsMock = vi.fn()
 const localGetSessionDetailMock = vi.fn()
 const localSearchSessionsMock = vi.fn()
 const localDeleteSessionMock = vi.fn()
 const localRenameSessionMock = vi.fn()
+const localCreateSessionMock = vi.fn()
+const localUpdateSessionMock = vi.fn()
 const getGroupChatServerMock = vi.fn()
 const getLocalUsageStatsMock = vi.fn()
 const getActiveProfileNameMock = vi.fn()
@@ -40,6 +44,7 @@ vi.mock('../../packages/server/src/services/hermes/hermes-cli', () => ({
   listSessions: vi.fn(),
   getSession: getSessionMock,
   deleteSession: vi.fn(),
+  deleteSessionForProfile: deleteHermesSessionForProfileMock,
   renameSession: vi.fn(),
 }))
 
@@ -47,6 +52,7 @@ vi.mock('../../packages/server/src/db/hermes/sessions-db', () => ({
   listSessionSummaries: vi.fn(),
   searchSessionSummaries: vi.fn(),
   getSessionDetailFromDb: getSessionDetailFromDbMock,
+  getExactSessionDetailFromDbWithProfile: getExactSessionDetailFromDbWithProfileMock,
   getUsageStatsFromDb: getUsageStatsFromDbMock,
 }))
 
@@ -57,6 +63,9 @@ vi.mock('../../packages/server/src/db/hermes/session-store', () => ({
   deleteSession: localDeleteSessionMock,
   renameSession: localRenameSessionMock,
   useLocalSessionStore: useLocalSessionStoreMock,
+  createSession: localCreateSessionMock,
+  getSession: getSessionMock,
+  updateSession: localUpdateSessionMock,
 }))
 
 vi.mock('../../packages/server/src/db/hermes/usage-store', () => ({
@@ -76,6 +85,7 @@ vi.mock('../../packages/server/src/services/hermes/model-context', () => ({
 
 vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
   getActiveProfileName: getActiveProfileNameMock,
+  listProfileNamesFromDisk: () => ['default', 'travel'],
 }))
 
 vi.mock('../../packages/server/src/db/hermes/compression-snapshot', () => ({
@@ -93,10 +103,6 @@ vi.mock('../../packages/server/src/lib/context-compressor/export-compressor', ()
   },
 }))
 
-vi.mock('../../packages/server/src/services/gateway-bootstrap', () => ({
-  getGatewayManagerInstance: () => null,
-}))
-
 describe('session conversations controller', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -105,13 +111,17 @@ describe('session conversations controller', () => {
     listConversationSummariesMock.mockReset()
     getConversationDetailMock.mockReset()
     getSessionDetailFromDbMock.mockReset()
+    getExactSessionDetailFromDbWithProfileMock.mockReset()
     getUsageStatsFromDbMock.mockReset()
     getSessionMock.mockReset()
+    deleteHermesSessionForProfileMock.mockReset()
     localListSessionsMock.mockReset()
     localGetSessionDetailMock.mockReset()
     localSearchSessionsMock.mockReset()
     localDeleteSessionMock.mockReset()
     localRenameSessionMock.mockReset()
+    localCreateSessionMock.mockReset()
+    localUpdateSessionMock.mockReset()
     getGroupChatServerMock.mockReset()
     getGroupChatServerMock.mockReturnValue(null)
     getLocalUsageStatsMock.mockReset()
@@ -198,6 +208,81 @@ describe('session conversations controller', () => {
 
     expect(ctx.status).toBe(404)
     expect(ctx.body).toEqual({ error: 'Conversation not found' })
+  })
+
+  it('prefers local session detail for Hermes history detail when available', async () => {
+    localGetSessionDetailMock.mockReturnValue({
+      id: 'cli-1',
+      source: 'cli',
+      title: 'Local complete',
+      messages: [
+        { id: 1, session_id: 'cli-1', role: 'user', content: 'local full message', timestamp: 1 },
+      ],
+    })
+    getSessionDetailFromDbMock.mockResolvedValue({
+      id: 'cli-1',
+      source: 'cli',
+      title: 'Hermes incomplete',
+      messages: [],
+    })
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { params: { id: 'cli-1' }, body: null }
+    await mod.getHermesSession(ctx)
+
+    expect(localGetSessionDetailMock).toHaveBeenCalledWith('cli-1')
+    expect(getSessionDetailFromDbMock).not.toHaveBeenCalled()
+    expect(getSessionMock).not.toHaveBeenCalled()
+    expect(ctx.body.session).toMatchObject({
+      id: 'cli-1',
+      title: 'Local complete',
+      messages: [{ content: 'local full message' }],
+    })
+  })
+
+  it('falls back to Hermes state.db when local history detail is missing', async () => {
+    localGetSessionDetailMock.mockReturnValue(null)
+    getSessionDetailFromDbMock.mockResolvedValue({
+      id: 'hermes-1',
+      source: 'cli',
+      title: 'Hermes detail',
+      messages: [
+        { id: 1, session_id: 'hermes-1', role: 'user', content: 'from hermes', timestamp: 1 },
+      ],
+    })
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { params: { id: 'hermes-1' }, body: null }
+    await mod.getHermesSession(ctx)
+
+    expect(localGetSessionDetailMock).toHaveBeenCalledWith('hermes-1')
+    expect(getSessionDetailFromDbMock).toHaveBeenCalledWith('hermes-1')
+    expect(getSessionMock).not.toHaveBeenCalled()
+    expect(ctx.body.session).toMatchObject({
+      id: 'hermes-1',
+      title: 'Hermes detail',
+      messages: [{ content: 'from hermes' }],
+    })
+  })
+
+  it('does not return api_server sessions from the Hermes history detail endpoint', async () => {
+    localGetSessionDetailMock.mockReturnValue({
+      id: 'api-1',
+      source: 'api_server',
+      title: 'API Server',
+      messages: [{ id: 1, session_id: 'api-1', role: 'user', content: 'local api', timestamp: 1 }],
+    })
+    getSessionDetailFromDbMock.mockResolvedValue(null)
+    getSessionMock.mockResolvedValue(null)
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { params: { id: 'api-1' }, body: null }
+    await mod.getHermesSession(ctx)
+
+    expect(localGetSessionDetailMock).toHaveBeenCalledWith('api-1')
+    expect(getSessionDetailFromDbMock).toHaveBeenCalledWith('api-1')
+    expect(ctx.status).toBe(404)
+    expect(ctx.body).toEqual({ error: 'Session not found' })
   })
 
   it('returns native state.db usage analytics for the requested period', async () => {
@@ -299,6 +384,42 @@ describe('session conversations controller', () => {
     expect(ctx.body.model_usage).toEqual([
       { model: 'unknown', input_tokens: 5, output_tokens: 2, cache_read_tokens: 3, cache_write_tokens: 1, reasoning_tokens: 0, sessions: 2 },
     ])
+  })
+
+  it('sets a session model and provider in the local session store', async () => {
+    getSessionMock.mockReturnValue({ id: 'session-1' })
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = {
+      params: { id: 'session-1' },
+      request: { body: { model: 'grok-4', provider: 'xai' } },
+      body: null,
+    }
+    await mod.setModel(ctx)
+
+    expect(localCreateSessionMock).not.toHaveBeenCalled()
+    expect(localUpdateSessionMock).toHaveBeenCalledWith('session-1', { model: 'grok-4', provider: 'xai' })
+    expect(ctx.body).toEqual({ ok: true })
+  })
+
+  it('deletes a current-profile Hermes history session even when no local Web UI session exists', async () => {
+    getActiveProfileNameMock.mockReturnValue('travel')
+    getSessionMock.mockReturnValue(null)
+    getExactSessionDetailFromDbWithProfileMock.mockResolvedValue({ id: 'history-only', messages: [] })
+    deleteHermesSessionForProfileMock.mockResolvedValue(true)
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { params: { id: 'history-only' }, body: null }
+    await mod.remove(ctx)
+
+    expect(getExactSessionDetailFromDbWithProfileMock).toHaveBeenCalledWith('history-only', 'travel')
+    expect(deleteHermesSessionForProfileMock).toHaveBeenCalledWith('history-only', 'travel')
+    expect(localDeleteSessionMock).not.toHaveBeenCalled()
+    expect(ctx.body).toEqual({
+      ok: true,
+      deleted: false,
+      hermes: { attempted: true, deleted: true, profile: 'travel', error: undefined },
+    })
   })
 
   describe('exportSession', () => {

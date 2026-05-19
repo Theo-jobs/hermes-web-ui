@@ -13,6 +13,7 @@ export interface HermesSessionRow {
   source: string
   user_id: string | null
   model: string
+  provider: string
   title: string | null
   started_at: number
   ended_at: number | null
@@ -86,6 +87,7 @@ function mapSessionRow(row: Record<string, unknown>): HermesSessionRow {
     source: String(row.source || 'api_server'),
     user_id: row.user_id != null ? String(row.user_id) : null,
     model: String(row.model || ''),
+    provider: String(row.provider || ''),
     title,
     started_at: Number(row.started_at || 0),
     ended_at: row.ended_at != null ? Number(row.ended_at) : null,
@@ -132,6 +134,7 @@ export function createSession(data: {
   profile?: string
   source?: string
   model?: string
+  provider?: string
   title?: string
   workspace?: string
 }): HermesSessionRow {
@@ -140,7 +143,7 @@ export function createSession(data: {
   if (!isSqliteAvailable()) {
     return {
       id: data.id, profile: data.profile || 'default', source,
-      user_id: null, model: data.model || '', title: data.title || null,
+      user_id: null, model: data.model || '', provider: data.provider || '', title: data.title || null,
       started_at: now, ended_at: null, end_reason: null,
       message_count: 0, tool_call_count: 0,
       input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0,
@@ -150,9 +153,9 @@ export function createSession(data: {
   }
   const db = getDb()!
   db.prepare(
-    `INSERT INTO ${SESSIONS_TABLE} (id, profile, source, model, title, started_at, last_active, workspace)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(data.id, data.profile || 'default', source, data.model || '', data.title || null, now, now, data.workspace || null)
+    `INSERT INTO ${SESSIONS_TABLE} (id, profile, source, model, provider, title, started_at, last_active, workspace)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(data.id, data.profile || 'default', source, data.model || '', data.provider || '', data.title || null, now, now, data.workspace || null)
   return getSession(data.id)!
 }
 
@@ -223,9 +226,10 @@ export function renameSession(id: string, title: string): boolean {
   return result.changes > 0
 }
 
-export function listSessions(profile: string, source?: string, limit = 2000): HermesSessionRow[] {
+export function listSessions(profile?: string, source?: string, limit = 2000): HermesSessionRow[] {
   if (!isSqliteAvailable()) return []
   const db = getDb()!
+  const profileFilter = profile?.trim()
 
   // Use a subquery to generate preview from first user message if not set
   const sql = `
@@ -243,13 +247,17 @@ export function listSessions(profile: string, source?: string, limit = 2000): He
         ''
       ) AS preview
     FROM ${SESSIONS_TABLE} s
-    WHERE s.profile = ?
+    WHERE 1 = 1
+      ${profileFilter ? 'AND s.profile = ?' : ''}
       ${source ? 'AND s.source = ?' : ''}
     ORDER BY s.last_active DESC
     LIMIT ?
   `
 
-  const params: any[] = [profile]
+  const params: any[] = []
+  if (profileFilter) {
+    params.push(profileFilter)
+  }
   if (source) {
     params.push(source)
   }

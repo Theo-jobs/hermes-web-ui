@@ -23,17 +23,11 @@ import { calcAndUpdateUsage, estimateUsageTokensFromMessages } from './usage'
 import { handleMessage } from './message-format'
 import { countTokens, SUMMARY_PREFIX } from '../../../lib/context-compressor'
 import { getCompressionSnapshot } from '../../../db/hermes/compression-snapshot'
+import { getGatewayManagerInstance } from '../../gateway-bootstrap'
 import type { ContentBlock, SessionState, ChatRunSource } from './types'
 
-export function resolveRunSource(source?: string, sessionId?: string): ChatRunSource {
-  const normalized = String(source || '').trim()
-  if (normalized === 'cli') return 'cli'
-  if (normalized === 'api_server') return 'api_server'
-  if (sessionId) {
-    const existing = getSession(sessionId)
-    if (existing?.source === 'cli') return 'cli'
-  }
-  return 'api_server'
+export function resolveRunSource(source?: string, _sessionId?: string): ChatRunSource {
+  return source === 'api_server' ? 'api_server' : 'cli'
 }
 
 export function resolveSessionBoundRunConfig(
@@ -59,7 +53,7 @@ export async function loadSessionStateFromDb(sid: string, _sessionMap: Map<strin
     let inputTokens: number
     let outputTokens: number
     const snapshot = getCompressionSnapshot(sid)
-    if (snapshot) {
+    if (snapshot && snapshot.lastMessageIndex >= 0 && snapshot.lastMessageIndex < messages.length) {
       const newMessages = messages.slice(snapshot.lastMessageIndex + 1)
       const newUsage = estimateUsageTokensFromMessages(newMessages)
       inputTokens = countTokens(SUMMARY_PREFIX + snapshot.summary) +
@@ -89,14 +83,13 @@ export async function loadSessionStateFromDb(sid: string, _sessionMap: Map<strin
 export async function handleApiRun(
   nsp: ReturnType<Server['of']>,
   socket: Socket,
-  data: { input: string | ContentBlock[]; session_id?: string; model?: string; instructions?: string; source?: string },
+  data: { input: string | ContentBlock[]; session_id?: string; model?: string; provider?: string; instructions?: string; source?: string },
   profile: string,
   sessionMap: Map<string, SessionState>,
-  gatewayManager: any,
   skipUserMessage = false,
   dequeueNextQueuedRun: (socket: Socket, sessionId: string, fallbackProfile?: string) => void,
 ) {
-  const { input, session_id, model, instructions } = data
+  const { input, session_id, model, provider, instructions } = data
 
   // Build full instructions with system prompt + workspace context
   let fullInstructions = instructions
@@ -110,8 +103,9 @@ export async function handleApiRun(
     }
   }
 
-  const upstream = gatewayManager.getUpstream(profile).replace(/\/$/, '')
-  const apiKey = (gatewayManager.getApiKeyForUpstream?.(profile) || gatewayManager.getApiKey(profile)) || undefined
+  const gatewayManager = getGatewayManagerInstance()
+  const upstream = gatewayManager?.getUpstream(profile).replace(/\/$/, '') || ''
+  const apiKey = (gatewayManager?.getApiKeyForUpstream?.(profile) || gatewayManager?.getApiKey(profile) || undefined)
 
   const runMarker = session_id
     ? `resp_run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
@@ -145,7 +139,7 @@ export async function handleApiRun(
       if (!getSession(session_id)) {
         const previewText = extractTextForPreview(input)
         const preview = previewText.replace(/[\r\n]/g, ' ').substring(0, 100)
-        createSession({ id: session_id, profile, source: 'api_server', model, title: preview })
+        createSession({ id: session_id, profile, source: 'api_server', model, provider, title: preview })
       }
 
       addMessage({
@@ -167,7 +161,7 @@ export async function handleApiRun(
       if (!getSession(session_id)) {
         const previewText = extractTextForPreview(input)
         const preview = previewText.replace(/[\r\n]/g, ' ').substring(0, 100)
-        createSession({ id: session_id, profile, source: 'api_server', model, title: preview })
+        createSession({ id: session_id, profile, source: 'api_server', model, provider, title: preview })
       }
       addMessage({
         session_id,
@@ -193,7 +187,11 @@ export async function handleApiRun(
     if (model) body.model = model
     body.instructions = fullInstructions
     if (session_id) {
-      const compressed = await buildCompressedHistory(session_id, profile, upstream, apiKey, emit, sessionMap)
+      const sessionRow = getSession(session_id)
+      const compressed = await buildCompressedHistory(session_id, profile, upstream, apiKey, emit, sessionMap, {
+        model: sessionRow?.model || model,
+        provider: sessionRow?.provider || provider,
+      })
       if (compressed.length > 0) {
         body.conversation_history = compressed
       }

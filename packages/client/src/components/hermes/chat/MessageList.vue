@@ -6,10 +6,12 @@ import { useChatStore } from "@/stores/hermes/chat";
 import thinkingVideoLight from "@/assets/thinking-light.mp4";
 import thinkingVideoDark from "@/assets/thinking-dark.mp4";
 import { useTheme } from "@/composables/useTheme";
+import { useToolTraceVisibility } from "@/composables/useToolTraceVisibility";
 
 const chatStore = useChatStore();
 const { t } = useI18n();
 const { isDark } = useTheme();
+const { toolTraceVisible } = useToolTraceVisibility();
 const listRef = ref<HTMLElement>();
 
 function formatTokens(n: number): string {
@@ -41,9 +43,16 @@ const currentToolCalls = computed(() => {
   return [...tools].reverse();
 });
 
-const displayMessages = computed(() =>
-  chatStore.messages.filter((m) => {
-    if (m.role === "tool") return false;
+const visibleToolCalls = computed(() =>
+  currentToolCalls.value.filter((tool) => !!tool.toolName),
+);
+
+const displayMessages = computed(() => {
+  const currentToolIds = new Set(currentToolCalls.value.map((tool) => tool.id));
+  return chatStore.messages.filter((m) => {
+    if (m.role === "tool") {
+      return toolTraceVisible.value && !!m.toolName && !(chatStore.isRunActive && currentToolIds.has(m.id));
+    }
     if (
       m.role === "assistant" &&
       m.isStreaming &&
@@ -54,8 +63,8 @@ const displayMessages = computed(() =>
       return false;
     }
     return true;
-  }),
-);
+  });
+});
 
 const queuedMessages = computed(() => {
   const sid = chatStore.activeSessionId;
@@ -82,9 +91,26 @@ function isNearBottom(threshold = 200): boolean {
 
 function scrollToBottom() {
   nextTick(() => {
-    if (listRef.value) {
-      listRef.value.scrollTop = listRef.value.scrollHeight;
-    }
+    const el = listRef.value;
+    if (!el) return;
+
+    // Tool-call rows, spinners, and the thinking video can change height across
+    // multiple layout frames. Pin to the actual maximum scroll offset now and
+    // again after the browser has applied the layout, otherwise Chrome scroll
+    // anchoring can keep an older anchor and visibly jump long chats upward.
+    const raf = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : (cb: FrameRequestCallback) => window.setTimeout(() => cb(Date.now()), 0);
+    const pin = () => {
+      const target = Math.max(0, el.scrollHeight - el.clientHeight);
+      el.scrollTop = target;
+    };
+
+    pin();
+    raf(() => {
+      pin();
+      raf(pin);
+    });
   });
 }
 
@@ -171,7 +197,7 @@ watch(currentToolCalls, () => {
           playsinline
           class="thinking-video"
         />
-        <div v-if="currentToolCalls.length > 0 || chatStore.compressionState || chatStore.abortState" class="tool-calls-panel">
+        <div v-if="visibleToolCalls.length > 0 || chatStore.compressionState || chatStore.abortState" class="tool-calls-panel">
           <!-- Abort indicator -->
           <div v-if="chatStore.abortState" class="tool-call-item compression-item">
             <svg
@@ -254,7 +280,7 @@ watch(currentToolCalls, () => {
           </div>
           <!-- Tool calls -->
           <div
-            v-for="tc in currentToolCalls"
+            v-for="tc in visibleToolCalls"
             :key="tc.id"
             class="tool-call-item"
           >
@@ -366,6 +392,7 @@ watch(currentToolCalls, () => {
 .message-list {
   flex: 1;
   overflow-y: auto;
+  overflow-anchor: none;
   padding: 20px;
   display: flex;
   flex-direction: column;

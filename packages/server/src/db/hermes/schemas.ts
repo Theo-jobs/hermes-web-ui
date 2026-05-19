@@ -34,6 +34,7 @@ export const SESSIONS_SCHEMA: Record<string, string> = {
   source: 'TEXT NOT NULL DEFAULT \'api_server\'',
   user_id: 'TEXT',
   model: 'TEXT NOT NULL DEFAULT \'\'',
+  provider: 'TEXT NOT NULL DEFAULT \'\'',
   title: 'TEXT',
   started_at: 'INTEGER NOT NULL',
   ended_at: 'INTEGER',
@@ -117,6 +118,7 @@ export const GC_ROOMS_SCHEMA: Record<string, string> = {
   maxHistoryTokens: 'INTEGER NOT NULL DEFAULT 32000',
   tailMessageCount: 'INTEGER NOT NULL DEFAULT 10',
   totalTokens: 'INTEGER NOT NULL DEFAULT 0',
+  sessionSeed: "TEXT NOT NULL DEFAULT '0'",
 }
 
 export const GC_MESSAGES_TABLE = 'gc_messages'
@@ -128,6 +130,14 @@ export const GC_MESSAGES_SCHEMA: Record<string, string> = {
   senderName: 'TEXT NOT NULL',
   content: 'TEXT NOT NULL',
   timestamp: 'INTEGER NOT NULL',
+  role: "TEXT NOT NULL DEFAULT 'user'",
+  tool_call_id: 'TEXT',
+  tool_calls: 'TEXT',
+  tool_name: 'TEXT',
+  finish_reason: 'TEXT',
+  reasoning: 'TEXT',
+  reasoning_details: 'TEXT',
+  reasoning_content: 'TEXT',
 }
 
 export const GC_ROOM_AGENTS_TABLE = 'gc_room_agents'

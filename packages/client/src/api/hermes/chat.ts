@@ -1,5 +1,5 @@
 import { io, type Socket } from 'socket.io-client'
-import { request, getBaseUrlValue, getApiKey } from '../client'
+import { getBaseUrlValue, getApiKey } from '../client'
 
 export type ContentBlock =
   | { type: 'text'; text: string }
@@ -17,6 +17,8 @@ export interface StartRunRequest {
   session_id?: string
   model?: string
   profile?: string
+  provider?: string
+  model_groups?: Array<{ provider: string; models: string[] }>
   queue_id?: string
   source?: 'api_server' | 'cli'
 }
@@ -614,8 +616,4 @@ export function startRunViaSocket(
       }
     },
   }
-}
-
-export async function fetchModels(): Promise<{ data: Array<{ id: string }> }> {
-  return request('/api/hermes/v1/models')
 }

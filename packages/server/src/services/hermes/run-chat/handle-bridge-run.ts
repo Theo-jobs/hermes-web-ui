@@ -5,7 +5,7 @@
 
 import type { Server, Socket } from 'socket.io'
 import { getSystemPrompt } from '../../../lib/llm-prompt'
-import { getSession, createSession, addMessage, updateSessionStats } from '../../../db/hermes/session-store'
+import { getSession, createSession, addMessage, updateSession, updateSessionStats } from '../../../db/hermes/session-store'
 import { updateUsage } from '../../../db/hermes/usage-store'
 import { logger, bridgeLogger } from '../../logger'
 import { AgentBridgeClient, type AgentBridgeMessage, type AgentBridgeOutput } from '../agent-bridge'
@@ -23,25 +23,25 @@ import {
 import { forceCompressBridgeHistory } from './compression'
 import { summarizeToolArguments } from './response-utils'
 import { buildDbHistory } from './compression'
-import { convertHistoryFormat } from './message-format'
 import type { ContentBlock, SessionState } from './types'
 import type { ChatMessage } from '../../../lib/context-compressor'
+import { resolveBridgeRunModelConfig, type RunModelGroup } from './model-config'
+import { filterBridgeToolCallMarkupDelta } from './bridge-delta'
 
 const BRIDGE_USAGE_FLUSH_DELAY_MS = 200
 
 export async function handleBridgeRun(
   nsp: ReturnType<Server['of']>,
   socket: Socket,
-  data: { input: string | ContentBlock[]; session_id?: string; model?: string; instructions?: string; source?: string },
+  data: { input: string | ContentBlock[]; session_id?: string; model?: string; provider?: string; model_groups?: RunModelGroup[]; instructions?: string; source?: string },
   profile: string,
   sessionMap: Map<string, SessionState>,
-  gatewayManager: any,
   bridge: AgentBridgeClient,
   _skipUserMessage = false,
   loadSessionStateFromDbFn: (sid: string, sessionMap: Map<string, SessionState>) => Promise<SessionState>,
   dequeueNextQueuedRun: (socket: Socket, sessionId: string, fallbackProfile?: string) => void,
 ) {
-  const { input, session_id, model, instructions } = data
+  const { input, session_id, instructions } = data
   if (!session_id) {
     socket.emit('run.failed', { event: 'run.failed', error: 'session_id is required for cli source' })
     return
@@ -51,6 +51,22 @@ export async function handleBridgeRun(
     ? `${getSystemPrompt()}\n${instructions}`
     : getSystemPrompt()
   const sessionRow = getSession(session_id)
+  const sessionModel = sessionRow?.model || ''
+  const sessionProvider = sessionRow?.provider || ''
+  const { model: resolvedModel, provider: resolvedProvider } = await resolveBridgeRunModelConfig({
+    profile,
+    sessionModel,
+    sessionProvider,
+    requestedModel: data.model,
+    requestedProvider: data.provider,
+    modelGroups: data.model_groups,
+  })
+  if (sessionRow) {
+    const updates: { model?: string; provider?: string } = {}
+    if (resolvedModel && sessionRow.model !== resolvedModel) updates.model = resolvedModel
+    if (resolvedProvider && sessionRow.provider !== resolvedProvider) updates.provider = resolvedProvider
+    if (Object.keys(updates).length > 0) updateSession(session_id, updates)
+  }
   if (sessionRow?.workspace) {
     const workspaceCtx = `[Current working directory: ${sessionRow.workspace}]`
     fullInstructions = `\n${workspaceCtx}\n${fullInstructions}`
@@ -76,6 +92,7 @@ export async function handleBridgeRun(
   state.bridgeOutput = ''
   state.bridgePendingAssistantContent = ''
   state.bridgePendingReasoningContent = ''
+  state.bridgePendingToolCallMarkup = ''
   state.bridgeToolCounter = 0
   state.bridgePendingTools = []
   state.responseRun = undefined
@@ -93,7 +110,7 @@ export async function handleBridgeRun(
   if (!getSession(session_id)) {
     const previewText = extractTextForPreview(input)
     const preview = previewText.replace(/[\r\n]/g, ' ').substring(0, 100)
-    createSession({ id: session_id, profile, source: 'cli', model, title: preview })
+    createSession({ id: session_id, profile, source: 'cli', model: resolvedModel, provider: resolvedProvider, title: preview })
   }
   addMessage({
     session_id,
@@ -113,12 +130,13 @@ export async function handleBridgeRun(
 
   const history = await buildCompressedHistory(
     session_id, profile,
-    gatewayManager.getUpstream(profile).replace(/\/$/, ''),
-    gatewayManager.getApiKey(profile) || undefined,
+    '',
+    undefined,
     emit,
     sessionMap,
+    { model: resolvedModel, provider: resolvedProvider },
   )
-  const bridgeHistory = history.length > 0 ? convertHistoryFormat(history) : history
+  const bridgeHistory = history
 
   try {
     const bridgeInput = isContentBlockArray(input)
@@ -142,7 +160,11 @@ export async function handleBridgeRun(
       bridgeHistory,
       fullInstructions,
       profile,
-      bridgeStorageInput !== undefined ? { storage_message: bridgeStorageInput } : {},
+      {
+        ...(bridgeStorageInput !== undefined ? { storage_message: bridgeStorageInput } : {}),
+        ...(resolvedModel ? { model: resolvedModel } : {}),
+        ...(resolvedProvider ? { provider: resolvedProvider } : {}),
+      },
     )
     state.runId = started.run_id
     bridgeLogger.info({
@@ -162,7 +184,7 @@ export async function handleBridgeRun(
     })
 
     for await (const chunk of bridge.streamOutput(started.run_id)) {
-      await applyBridgeChunkAsync(nsp, socket, state, session_id, runMarker, chunk, emit, profile, sessionMap, gatewayManager, bridge, dequeueNextQueuedRun)
+      await applyBridgeChunkAsync(nsp, socket, state, session_id, runMarker, chunk, emit, profile, sessionMap, bridge, dequeueNextQueuedRun)
       if (chunk.done) break
     }
   } catch (err: any) {
@@ -175,6 +197,7 @@ export async function handleBridgeRun(
     state.runId = undefined
     state.activeRunMarker = undefined
     state.events = []
+    state.bridgePendingToolCallMarkup = undefined
     flushBridgePendingToDb(state, session_id)
     updateSessionStats(session_id)
     const message = err instanceof Error ? err.message : String(err)
@@ -199,7 +222,6 @@ async function applyBridgeChunkAsync(
   emit: (event: string, payload: any) => void,
   profile: string,
   sessionMap: Map<string, SessionState>,
-  gatewayManager: any,
   bridge: AgentBridgeClient,
   dequeueNextQueuedRun: (socket: Socket, sessionId: string, fallbackProfile?: string) => void,
 ): Promise<void> {
@@ -312,8 +334,6 @@ async function applyBridgeChunkAsync(
             sessionId,
             profile,
             ev.messages as ChatMessage[],
-            (p: string) => gatewayManager.getUpstream(p),
-            (p: string) => gatewayManager.getApiKey(p),
           )
           state.bridgeCompressionResults = state.bridgeCompressionResults || {}
           state.bridgeCompressionResults[String(ev.request_id)] = compressed
@@ -376,30 +396,33 @@ async function applyBridgeChunkAsync(
   }
 
   if (chunk.delta) {
-    state.bridgeOutput = (state.bridgeOutput || '') + chunk.delta
-    state.bridgePendingAssistantContent = (state.bridgePendingAssistantContent || '') + chunk.delta
-    const last = [...state.messages].reverse().find(m => m.runMarker === runMarker)
-    if (last?.role === 'assistant' && last.finish_reason == null) {
-      last.content += chunk.delta
-      syncBridgeReasoningToMessage(last, state.bridgePendingReasoningContent)
-    } else {
-      state.messages.push({
-        id: state.messages.length + 1,
-        session_id: sessionId,
-        runMarker,
-        role: 'assistant',
-        content: chunk.delta,
-        reasoning: state.bridgePendingReasoningContent || null,
-        reasoning_content: state.bridgePendingReasoningContent || null,
-        timestamp: Math.floor(Date.now() / 1000),
+    const delta = filterBridgeToolCallMarkupDelta(state, chunk.delta)
+    if (delta) {
+      state.bridgeOutput = (state.bridgeOutput || '') + delta
+      state.bridgePendingAssistantContent = (state.bridgePendingAssistantContent || '') + delta
+      const last = [...state.messages].reverse().find(m => m.runMarker === runMarker)
+      if (last?.role === 'assistant' && last.finish_reason == null) {
+        last.content += delta
+        syncBridgeReasoningToMessage(last, state.bridgePendingReasoningContent)
+      } else {
+        state.messages.push({
+          id: state.messages.length + 1,
+          session_id: sessionId,
+          runMarker,
+          role: 'assistant',
+          content: delta,
+          reasoning: state.bridgePendingReasoningContent || null,
+          reasoning_content: state.bridgePendingReasoningContent || null,
+          timestamp: Math.floor(Date.now() / 1000),
+        })
+      }
+      emit('message.delta', {
+        event: 'message.delta',
+        run_id: chunk.run_id,
+        delta,
+        output: state.bridgeOutput,
       })
     }
-    emit('message.delta', {
-      event: 'message.delta',
-      run_id: chunk.run_id,
-      delta: chunk.delta,
-      output: state.bridgeOutput,
-    })
   }
 
   if (!chunk.done) return
@@ -414,6 +437,7 @@ async function applyBridgeChunkAsync(
   }
 
   flushBridgePendingToDb(state, sessionId)
+  state.bridgePendingToolCallMarkup = undefined
   updateSessionStats(sessionId)
   await delay(BRIDGE_USAGE_FLUSH_DELAY_MS)
   const usage = await calcAndUpdateUsage(sessionId, state, emit)

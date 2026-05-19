@@ -1,6 +1,6 @@
 import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
 import { generateFollowupSuggestions } from '@/api/hermes/followups'
-import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
+import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, setSessionModel, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
 import { getApiKey } from '@/api/client'
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
@@ -61,9 +61,9 @@ export interface PendingApproval {
 
 export interface Session {
   id: string
-  title: string
   profile?: string
   spaceId?: string | null
+  title: string
   source?: string
   messages: Message[]
   createdAt: number
@@ -158,10 +158,11 @@ async function buildContentBlocks(
 }
 
 function mapHermesMessages(msgs: HermesMessage[]): Message[] {
-  // Filter out assistant messages with empty content
+  // Filter out assistant messages with no display content unless they carry tool call metadata
+  // needed to name later tool result rows when resuming persisted history.
   const filteredMsgs = msgs.filter(m => {
     if (m.role === 'assistant') {
-      return m.content && m.content.trim() !== ''
+      return (m.tool_calls?.length || 0) > 0 || (m.content && m.content.trim() !== '')
     }
     return true
   })
@@ -191,7 +192,7 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
           role: 'tool',
           content: '',
           timestamp: Math.round(msg.timestamp * 1000),
-          toolName: tc.function?.name || 'tool',
+          toolName: tc.function?.name || undefined,
           toolCallId: tc.id,
           toolArgs: tc.function?.arguments || undefined,
           toolStatus: 'done',
@@ -203,7 +204,7 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
     // Tool result messages
     if (msg.role === 'tool') {
       const tcId = msg.tool_call_id || ''
-      const toolName = msg.tool_name || toolNameMap.get(tcId) || 'tool'
+      const toolName = msg.tool_name || toolNameMap.get(tcId) || undefined
       const toolArgs = toolArgsMap.get(tcId) || undefined
       // Extract a short preview from the content
       let preview = ''
@@ -252,14 +253,14 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
 function mapHermesSession(s: SessionSummary): Session {
   return {
     id: s.id,
+    profile: s.profile || 'default',
     title: s.title || '',
-    profile: s.profile,
     source: s.source || undefined,
     messages: [],
     createdAt: Math.round(s.started_at * 1000),
     updatedAt: Math.round((s.last_active || s.ended_at || s.started_at) * 1000),
     model: s.model,
-    provider: (s as any).billing_provider || '',
+    provider: s.provider || (s as any).billing_provider || '',
     messageCount: s.message_count,
     endedAt: s.ended_at != null ? Math.round(s.ended_at * 1000) : null,
     lastActiveAt: s.last_active != null ? Math.round(s.last_active * 1000) : undefined,
@@ -491,10 +492,19 @@ export const useChatStore = defineStore('chat', () => {
     return streamStates.value.has(sessionId) || serverWorking.value.has(sessionId)
   }
 
-  async function loadSessions() {
+  function clearActiveSession() {
+    activeSessionId.value = null
+    activeSession.value = null
+    focusMessageId.value = null
+    setAbortState(null)
+    if (activeSessionId.value) setCompressionStateForSession(activeSessionId.value, null)
+    removeItem(storageKey())
+  }
+
+  async function loadSessions(profile?: string | null) {
     isLoadingSessions.value = true
     try {
-      const list = await fetchSessions()
+      const list = await fetchSessions(undefined, undefined, profile || undefined)
       const fresh = list.map(mapHermesSession)
       // Preserve already-loaded messages for sessions that are still present,
       // so we don't blow away the active session's messages on refresh.
@@ -505,12 +515,7 @@ export const useChatStore = defineStore('chat', () => {
       }
       sessions.value = fresh
 
-      // Restore the active session for the selected next gateway/profile.
-      // EKKO chat can target remote profiles (remote-agent/remote-peer) without changing
-      // the global Hermes profile selector, so getProfileName() alone would
-      // restore the default/local chat after a refresh and make remote chats
-      // appear to vanish. Keep a per-target active id and fall back to that
-      // profile's most recent session.
+      // Restore active session for the selected next gateway/profile.
       const targetProfile = nextSessionProfile.value || getProfileName() || 'default'
       const savedId = activeSessionId.value
       const savedForTarget = localStorage.getItem(profileStorageKey(targetProfile))
@@ -521,6 +526,8 @@ export const useChatStore = defineStore('chat', () => {
           : sessions.value.find(s => (s.profile || 'default') === targetProfile)?.id || sessions.value[0]?.id
       if (targetId) {
         await switchSession(targetId)
+      } else {
+        clearActiveSession()
       }
     } catch (err) {
       console.error('Failed to load sessions:', err)
@@ -550,17 +557,19 @@ export const useChatStore = defineStore('chat', () => {
   }
 
 
-  function createSession(): Session {
+  function createSession(options: { profile?: string; model?: string; provider?: string } = {}): Session {
+    const profile = options.profile || nextSessionProfile.value || useProfilesStore().activeProfileName || 'default'
     const session: Session = {
       id: uid(),
+      profile,
       title: '',
-      profile: nextSessionProfile.value || getProfileName(),
-      spaceId: nextSessionSpaceId.value,
-      source: 'api_server',
+      spaceId: profile === nextSessionProfile.value ? nextSessionSpaceId.value : null,
+      source: 'cli',
       messages: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      model: nextSessionModel.value || undefined,
+      model: options.model || (profile === nextSessionProfile.value ? nextSessionModel.value || undefined : undefined),
+      provider: options.provider || '',
     }
     sessions.value.unshift(session)
     return session
@@ -741,23 +750,31 @@ export const useChatStore = defineStore('chat', () => {
     resumeServerWorkingRun(sessionId)
   }
 
-  function newChat() {
-    const session = createSession()
-    // Inherit current global model
+  function newChat(options: { profile?: string; model?: string; provider?: string } = {}) {
     const appStore = useAppStore()
-    session.model = session.model || appStore.selectedModel || undefined
+    const session = createSession({
+      profile: options.profile,
+      model: options.model || appStore.selectedModel || undefined,
+      provider: options.provider || appStore.selectedProvider || '',
+    })
     switchSession(session.id)
   }
 
-  async function switchSessionModel(modelId: string, provider?: string) {
-    if (!activeSession.value) return
-    activeSession.value.model = modelId
-    activeSession.value.provider = provider || ''
-    // If provider changed, update global config too (Hermes requires it)
-    if (provider) {
-      const { useAppStore } = await import('./app')
-      await useAppStore().switchModel(modelId, provider)
+  async function switchSessionModel(modelId: string, provider?: string, sessionId?: string): Promise<boolean> {
+    const targetId = sessionId || activeSession.value?.id
+    if (!targetId) return false
+    const ok = await setSessionModel(targetId, modelId, provider || '')
+    if (!ok) return false
+    const target = sessions.value.find(s => s.id === targetId)
+    if (target) {
+      target.model = modelId
+      target.provider = provider || ''
     }
+    if (activeSession.value?.id === targetId) {
+      activeSession.value.model = modelId
+      activeSession.value.provider = provider || ''
+    }
+    return true
   }
 
   async function deleteSession(sessionId: string) {
@@ -1059,18 +1076,23 @@ export const useChatStore = defineStore('chat', () => {
       switchSession(session.id)
     }
 
-    // Capture session at send time — all callbacks use this, not activeSessionId
+    // Capture session ID at send time — all callbacks use this, not activeSessionId
     const sid = activeSessionId.value!
-    const sessionAtSend = sessions.value.find(s => s.id === sid) || activeSession.value
-    const shouldQueue = isSessionLive(sid)
+    const shouldSendInitialSessionConfig = activeSession.value
+      ? activeSession.value.messageCount == null || activeSession.value.messageCount === 0
+      : false
+    const isBridgeSlashCommand = content.trim().startsWith('/')
+    const wasLiveBeforeSend = isSessionLive(sid)
+    const shouldQueue = wasLiveBeforeSend && !isBridgeSlashCommand
 
     const userMsg: Message = {
       id: uid(),
-      role: 'user',
+      role: isBridgeSlashCommand ? 'command' : 'user',
       content: content.trim(),
       timestamp: Date.now(),
       attachments: attachments && attachments.length > 0 ? attachments : undefined,
       queued: shouldQueue,
+      systemType: isBridgeSlashCommand ? 'command' : undefined,
     }
 
     if (!shouldQueue) {
@@ -1127,14 +1149,25 @@ export const useChatStore = defineStore('chat', () => {
       }
 
       const appStore = useAppStore()
-      const currentSession = sessions.value.find(s => s.id === sid) || sessionAtSend
+      await appStore.waitForModelsForRun()
+      const currentSession = sessions.value.find(s => s.id === sid) || activeSession.value
       const sessionModel = currentSession?.model || appStore.selectedModel
+      const sessionProvider = currentSession?.provider || appStore.selectedProvider
       const runPayload = {
         input,
         session_id: sid,
-        model: sessionModel || undefined,
         profile: currentSession?.profile || nextSessionProfile.value || undefined,
+        model: shouldSendInitialSessionConfig ? sessionModel || undefined : undefined,
+        provider: shouldSendInitialSessionConfig ? sessionProvider || undefined : undefined,
+        model_groups: appStore.modelGroups.map(group => ({
+          provider: group.provider,
+          models: group.models,
+        })),
         queue_id: userMsg.id,
+        source: 'cli' as const,
+      }
+      if (shouldSendInitialSessionConfig && activeSession.value) {
+        activeSession.value.messageCount = Math.max(activeSession.value.messageCount || 0, 1)
       }
 
       if (shouldQueue) {
@@ -1179,7 +1212,7 @@ export const useChatStore = defineStore('chat', () => {
           switch (evt.event) {
             case 'run.started':
               setAbortState(null)
-              setCompressionState(null)
+              setCompressionStateForSession(sid, null)
               runProducedAssistantText = false
               runHadToolActivity = false
               closeStreamingAssistant()
@@ -1648,7 +1681,7 @@ export const useChatStore = defineStore('chat', () => {
 
         case 'run.started':
           setAbortState(null)
-          setCompressionState(null)
+          setCompressionStateForSession(sid, null)
           runProducedAssistantText = false
           runHadToolActivity = false
           closeStreamingAssistant()

@@ -29,6 +29,8 @@ export interface QueuedRun {
   queue_id: string
   input: string | ContentBlock[]
   model?: string
+  provider?: string
+  model_groups?: Array<{ provider: string; models: string[] }>
   instructions?: string
   profile: string
   source?: ChatRunSource
@@ -50,6 +52,7 @@ export interface SessionState {
   source?: ChatRunSource
   bridgePendingAssistantContent?: string
   bridgePendingReasoningContent?: string
+  bridgePendingToolCallMarkup?: string
   bridgeOutput?: string
   bridgeToolCounter?: number
   bridgePendingTools?: Array<{
