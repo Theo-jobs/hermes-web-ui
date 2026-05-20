@@ -1,14 +1,23 @@
 import { io, Socket } from 'socket.io-client'
+import { randomBytes } from 'crypto'
 import { getToken } from '../../../services/auth'
 import { logger } from '../../../services/logger'
 import { updateUsage } from '../../../db/hermes/usage-store'
 import { AgentBridgeClient, type AgentBridgeMessage, type AgentBridgeOutput } from '../agent-bridge'
 import { convertContentBlocksForAgent, isContentBlockArray } from '../run-chat/content-blocks'
 import type { ContentBlock } from '../run-chat/types'
+import {
+    isAllAgentsMentioned,
+    resolveMentionTargets,
+    stripMentionRoutingTokens,
+} from './mention-routing'
+
+export const GROUP_CHAT_AGENT_SOCKET_SECRET = randomBytes(32).toString('hex')
 
 // ─── Types ────────────────────────────────────────────────────
 
 interface AgentConfig {
+    agentId?: string
     profile: string
     name: string
     description: string
@@ -72,7 +81,7 @@ class AgentClient {
     private pendingToolBaseIds = new Map<string, string>()
 
     constructor(config: AgentConfig, handlers: AgentEventHandler = {}) {
-        this.agentId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+        this.agentId = config.agentId || Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
         this.profile = config.profile
         this.name = config.name
         this.description = config.description
@@ -102,7 +111,11 @@ class AgentClient {
         this.socket = io(`http://127.0.0.1:${actualPort}/group-chat`, {
             auth: {
                 token: token || undefined,
+                userId: this.agentId,
                 name: this.name,
+                description: this.description,
+                source: 'agent',
+                agentSocketSecret: GROUP_CHAT_AGENT_SOCKET_SECRET,
             },
             transports: ['websocket'],
             reconnection: true,
@@ -238,7 +251,7 @@ class AgentClient {
         }
     }
 
-    // ─── Hermes Gateway Integration ────────────────────────────
+    // ─── Hermes Agent Bridge Integration ───────────────────────
 
     /**
      * Handle an @mention from the server side.
@@ -302,20 +315,20 @@ class AgentClient {
                 }
             }
 
-            // Keep the original mentions visible and add an explicit routing note.
-            // When a user mentions multiple agents, stripping only this agent's
-            // name can make the remaining input look like it was meant for
-            // someone else.
-            const routedPrefix = `群聊系统：这条消息已经提及你（${this.name}），请直接回复；即使消息同时提及其他成员，也不要因此输出空回复。`
-            const ownMentionPattern = new RegExp(`@${this.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'gi')
+            // Keep routing explicit while removing only the mention tokens that
+            // selected this agent. This avoids making @all look like an
+            // instruction for the model to fan out another routing cycle.
+            const routedPrefix = isAllAgentsMentioned(msg.content)
+                ? `群聊系统：这条消息通过 @all 提及所有 agent，你是其中之一，请直接回复。`
+                : `群聊系统：这条消息已经提及你（${this.name}），请直接回复；即使消息同时提及其他成员，也不要因此输出空回复。`
             const rawInput = msg.input || msg.content
             const input = isContentBlockArray(rawInput)
                 ? rawInput.map((block) => {
                     if (block.type !== 'text') return block
-                    const text = String(block.text || msg.content).replace(ownMentionPattern, '').trim()
+                    const text = stripMentionRoutingTokens(String(block.text || msg.content), this.name)
                     return { ...block, text: `${routedPrefix}\n\n原始消息：${text || msg.content}` }
                 })
-                : `${routedPrefix}\n\n原始消息：${msg.content.replace(ownMentionPattern, '').trim() || msg.content}`
+                : `${routedPrefix}\n\n原始消息：${stripMentionRoutingTokens(msg.content, this.name) || msg.content}`
             const bridgeInput: AgentBridgeMessage = isContentBlockArray(input)
                 ? await convertContentBlocksForAgent(input)
                 : input
@@ -815,12 +828,7 @@ export class AgentClients {
      */
     async processMentions(roomId: string, msg: MentionMessage): Promise<void> {
         const agents = this.getAgents(roomId)
-        const senderName = msg.senderName.toLowerCase()
-
-        const mentioned = agents.filter(a => (
-            a.name.toLowerCase() !== senderName &&
-            isAgentMentioned(msg.content, a.name)
-        ))
+        const mentioned = resolveMentionTargets(agents, msg.content, msg.senderId)
         if (mentioned.length === 0) return
 
         logger.debug(`[AgentClients] ${mentioned.map(a => a.name).join(', ')} mentioned by ${msg.senderName}`)
@@ -885,10 +893,4 @@ export class AgentClients {
 
 function nextMentionDepth(msg: MentionMessage): number {
     return Math.max(0, msg.mentionDepth || 0) + 1
-}
-
-function isAgentMentioned(content: string, agentName: string): boolean {
-    const escaped = agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = new RegExp(`@${escaped}(?=$|\\s|[.,!?;:，。！？；：])`, 'i')
-    return pattern.test(content)
 }
