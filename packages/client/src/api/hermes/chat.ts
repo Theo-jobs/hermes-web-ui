@@ -59,6 +59,7 @@ export interface RunEvent {
 // ============================
 
 let chatRunSocket: Socket | null = null
+let chatRunSocketProfile = 'default'
 let globalListenersRegistered = false
 
 /**
@@ -387,8 +388,20 @@ export function getChatRunSocket(): Socket | null {
   return chatRunSocket
 }
 
-export function connectChatRun(): Socket {
-  if (chatRunSocket?.connected) return chatRunSocket
+function resolveActiveProfile(): string {
+  try {
+    const { useProfilesStore } = require('@/stores/hermes/profiles')
+    const profilesStore = useProfilesStore()
+    return profilesStore.activeProfileName || 'default'
+  } catch {
+    // Fallback to localStorage during early initialization
+    return localStorage.getItem('hermes_active_profile_name') || 'default'
+  }
+}
+
+export function connectChatRun(profileOverride?: string): Socket {
+  const profile = profileOverride || resolveActiveProfile()
+  if (chatRunSocket?.connected && chatRunSocketProfile === profile) return chatRunSocket
 
   // Clean up old socket to prevent duplicate event listeners
   if (chatRunSocket) {
@@ -399,17 +412,7 @@ export function connectChatRun(): Socket {
 
   const baseUrl = getBaseUrlValue()
   const token = getApiKey()
-
-  // Get active profile from store (authoritative source)
-  let profile = 'default'
-  try {
-    const { useProfilesStore } = require('@/stores/hermes/profiles')
-    const profilesStore = useProfilesStore()
-    profile = profilesStore.activeProfileName || 'default'
-  } catch {
-    // Fallback to localStorage during early initialization
-    profile = localStorage.getItem('hermes_active_profile_name') || 'default'
-  }
+  chatRunSocketProfile = profile
 
   chatRunSocket = io(`${baseUrl}/chat-run`, {
     auth: { token },
@@ -463,6 +466,7 @@ export function disconnectChatRun(): void {
   if (chatRunSocket) {
     chatRunSocket.disconnect()
     chatRunSocket = null
+    chatRunSocketProfile = 'default'
     globalListenersRegistered = false
     sessionEventHandlers.clear()
   }
@@ -500,7 +504,7 @@ export function startRunViaSocket(
   }
 
   let closed = false
-  const socket = connectChatRun()
+  const socket = connectChatRun(body.profile)
 
   if (sessionEventHandlers.has(sid)) {
     socket.emit('run', body)

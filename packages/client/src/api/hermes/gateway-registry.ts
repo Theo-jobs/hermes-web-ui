@@ -48,3 +48,14 @@ export async function fetchSpaces(): Promise<SpaceRegistryEntry[]> {
   return res.spaces
 }
 
+export async function upsertSpaceRegistryEntry(space: Partial<SpaceRegistryEntry> & { id: string }): Promise<SpaceRegistryEntry> {
+  const res = await request<{ space: SpaceRegistryEntry }>(`/api/hermes/spaces/${encodeURIComponent(space.id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(space),
+  })
+  return res.space
+}
+
+export async function deleteSpaceRegistryEntry(id: string): Promise<void> {
+  await request(`/api/hermes/spaces/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}

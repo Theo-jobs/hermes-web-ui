@@ -64,3 +64,30 @@ export async function testGateway(ctx: any) {
 export async function listSpaces(ctx: any) {
   ctx.body = { spaces: gatewayRegistryService.listSpaces() }
 }
+
+export async function upsertSpace(ctx: any) {
+  try {
+    const body = ctx.request.body || {}
+    const space = gatewayRegistryService.upsertSpace({
+      ...body,
+      id: ctx.params.id || body.id,
+    })
+    ctx.body = { space }
+  } catch (err) {
+    badRequest(ctx, err)
+  }
+}
+
+export async function deleteSpace(ctx: any) {
+  try {
+    const deleted = gatewayRegistryService.deleteSpace(ctx.params.id)
+    if (!deleted) {
+      ctx.status = 404
+      ctx.body = { error: 'space not found' }
+      return
+    }
+    ctx.body = { ok: true }
+  } catch (err) {
+    badRequest(ctx, err)
+  }
+}

@@ -10,4 +10,6 @@ gatewayRegistryRoutes.delete('/api/hermes/gateway-registry/:id', ctrl.deleteGate
 gatewayRegistryRoutes.get('/api/hermes/gateway-registry/:id/health', ctrl.testGateway)
 gatewayRegistryRoutes.post('/api/hermes/gateway-registry/:id/test', ctrl.testGateway)
 gatewayRegistryRoutes.get('/api/hermes/spaces', ctrl.listSpaces)
-
+gatewayRegistryRoutes.post('/api/hermes/spaces', ctrl.upsertSpace)
+gatewayRegistryRoutes.put('/api/hermes/spaces/:id', ctrl.upsertSpace)
+gatewayRegistryRoutes.delete('/api/hermes/spaces/:id', ctrl.deleteSpace)

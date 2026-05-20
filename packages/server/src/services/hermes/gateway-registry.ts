@@ -147,6 +147,20 @@ function normalizeGateway(input: unknown, existing?: GatewayRegistryEntry): Gate
   }
 }
 
+function normalizeSpace(input: unknown, existing?: SpaceRegistryEntry): SpaceRegistryEntry {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('space payload must be an object')
+  }
+  const body = input as Record<string, unknown>
+  const id = normalizeName(body.id ?? existing?.id, 'id')
+  return {
+    id,
+    displayName: normalizeOptionalString(body.displayName ?? existing?.displayName, 'displayName', 128) || id,
+    gatewayId: normalizeName(body.gatewayId ?? existing?.gatewayId, 'gatewayId'),
+    profile: normalizeName(body.profile ?? existing?.profile, 'profile'),
+  }
+}
+
 function redactGateway(entry: GatewayRegistryEntry): GatewayRegistryEntry & { hasApiKey: boolean } {
   return {
     ...entry,
@@ -230,6 +244,10 @@ export class GatewayRegistryService {
     writeJsonFile(gatewaysPath(), { gateways })
   }
 
+  private writeSpaceFile(spaces: SpaceRegistryEntry[]) {
+    writeJsonFile(spacesPath(), { spaces })
+  }
+
   private ensureSpaceFile(): SpaceRegistryFile {
     const path = spacesPath()
     if (!existsSync(path)) {
@@ -258,6 +276,32 @@ export class GatewayRegistryService {
 
   listSpaces() {
     return this.ensureSpaceFile().spaces
+  }
+
+  upsertSpace(input: unknown) {
+    const file = this.ensureSpaceFile()
+    const requestedId = input && typeof input === 'object' ? (input as any).id : undefined
+    const existing = requestedId ? file.spaces.find(s => s.id === requestedId) : undefined
+    const space = normalizeSpace(input, existing)
+    const gateway = this.ensureGatewayFile().gateways.find(g => g.id === space.gatewayId)
+    if (!gateway) throw new Error('gateway not found')
+    if (gateway.readonly) throw new Error('readonly gateway space cannot be changed')
+    const index = file.spaces.findIndex(s => s.id === space.id)
+    if (index >= 0) file.spaces[index] = space
+    else file.spaces.push(space)
+    this.writeSpaceFile(file.spaces)
+    return space
+  }
+
+  deleteSpace(id: string) {
+    const spaceId = normalizeName(id, 'id')
+    const file = this.ensureSpaceFile()
+    const space = file.spaces.find(s => s.id === spaceId)
+    if (!space) return false
+    const gateway = this.ensureGatewayFile().gateways.find(g => g.id === space.gatewayId)
+    if (gateway?.readonly) throw new Error('readonly gateway space cannot be deleted')
+    this.writeSpaceFile(file.spaces.filter(s => s.id !== spaceId))
+    return true
   }
 
   upsertGateway(input: unknown) {

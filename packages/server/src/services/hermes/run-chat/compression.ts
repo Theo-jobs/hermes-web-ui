@@ -80,7 +80,7 @@ async function getRunChatCompressionConfig(profile: string, contextLength: numbe
     logger.warn(err, '[context-compress] failed to read compression config for profile %s, using defaults', profile)
   }
 
-  const threshold = raw.threshold == null ? 0.7 : clampRatio(raw.threshold, 0.7, 0.05, 0.95)
+  const threshold = raw.threshold == null ? 0.5 : clampRatio(raw.threshold, 0.5, 0.05, 0.95)
   const targetRatio = clampRatio(raw.target_ratio, 0.2, 0.01, 0.8)
   const protectLastN = clampInt(raw.protect_last_n, 20, 0, 500)
   const protectFirstN = clampInt(raw.protect_first_n, 3, 0, 100)
