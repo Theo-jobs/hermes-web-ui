@@ -84,6 +84,108 @@ describe('gateway target option helpers', () => {
     })).toEqual({ provider: 'custom:remote', model: 'remote-special' })
   })
 
+  it('uses the gateway provider for a gateway default model', () => {
+    const options = buildGatewayTargetOptions({
+      gateways: [
+        {
+          id: 'hefeng',
+          profile: 'hefeng',
+          type: 'remote',
+          displayName: 'Hefeng',
+          provider: 'custom:hefeng',
+          defaultModel: 'hefeng-model',
+        },
+      ],
+      spaces: [
+        { id: 'hefeng-work', displayName: 'Hefeng Work', gatewayId: 'hefeng', profile: 'hefeng' },
+      ],
+      fallbackProfile: 'default',
+      profileModelGroups: [],
+      globalModelGroups: globalGroups,
+      selectedProvider: 'custom:nas',
+      selectedModel: 'nas-default',
+    })
+
+    expect(options[0]).toMatchObject({
+      profile: 'hefeng',
+      spaceId: 'hefeng-work',
+      gatewayType: 'remote',
+      source: 'api_server',
+      provider: 'custom:hefeng',
+      model: 'hefeng-model',
+      defaultModel: 'hefeng-model',
+    })
+  })
+
+  it('routes custom gateways with upstreams through api server and local gateways through cli', () => {
+    const options = buildGatewayTargetOptions({
+      gateways: [
+        { id: 'local-default', profile: 'default', type: 'local', displayName: 'Local' },
+        { id: 'custom-remote', profile: 'customRemote', type: 'custom', displayName: 'Custom Remote', upstream: 'https://example.test' },
+      ],
+      spaces: [],
+      fallbackProfile: 'default',
+      profileModelGroups: [],
+      globalModelGroups: globalGroups,
+      selectedProvider: 'custom:nas',
+      selectedModel: 'nas-default',
+    })
+
+    expect(options.find(option => option.gatewayName === 'Local')?.source).toBe('cli')
+    expect(options.find(option => option.gatewayName === 'Custom Remote')?.source).toBe('api_server')
+  })
+
+  it('keeps the gateway provider when the default model exists in multiple providers', () => {
+    expect(resolveModelSelectionForGatewayTarget({
+      profile: 'hefeng',
+      defaultProvider: 'custom:hefeng',
+      defaultModel: 'shared-model',
+      profileModelGroups: [],
+      globalModelGroups: [
+        { provider: 'custom:nas', label: 'NAS', base_url: '', api_key: '', models: ['shared-model'] },
+        { provider: 'custom:hefeng', label: 'Hefeng', base_url: '', api_key: '', models: ['shared-model'] },
+      ],
+      selectedProvider: 'custom:nas',
+      selectedModel: 'shared-model',
+    })).toEqual({ provider: 'custom:hefeng', model: 'shared-model' })
+  })
+
+  it('keeps gateway-only targets distinct from profile fallbacks', () => {
+    const options = buildGatewayTargetOptions({
+      gateways: [
+        { id: 'remote-one', profile: 'remote-agent', type: 'remote', displayName: 'Remote One' },
+        { id: 'remote-two', profile: 'remote-agent', type: 'remote', displayName: 'Remote Two' },
+      ],
+      spaces: [],
+      fallbackProfile: 'default',
+      profileModelGroups: [],
+      globalModelGroups: globalGroups,
+      selectedProvider: 'custom:nas',
+      selectedModel: 'nas-default',
+    })
+
+    expect(options.map(option => option.value)).toEqual(['gateway:remote-one', 'gateway:remote-two'])
+  })
+
+  it('does not hide gateway-only targets when another gateway with the same profile has a space', () => {
+    const options = buildGatewayTargetOptions({
+      gateways: [
+        { id: 'remote-one', profile: 'remote-agent', type: 'remote', displayName: 'Remote One' },
+        { id: 'remote-two', profile: 'remote-agent', type: 'remote', displayName: 'Remote Two' },
+      ],
+      spaces: [
+        { id: 'remote-one-work', displayName: 'Remote One Work', gatewayId: 'remote-one', profile: 'remote-agent' },
+      ],
+      fallbackProfile: 'default',
+      profileModelGroups: [],
+      globalModelGroups: globalGroups,
+      selectedProvider: 'custom:nas',
+      selectedModel: 'nas-default',
+    })
+
+    expect(options.map(option => option.value)).toEqual(['remote-one-work', 'gateway:remote-two'])
+  })
+
   it('prefers profile-specific groups but keeps global NAS choices available', () => {
     const profileModelGroups: ProfileAvailableModels[] = [{
       profile: 'minion59',

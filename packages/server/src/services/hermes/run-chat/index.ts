@@ -12,7 +12,8 @@ import type { Server, Socket } from 'socket.io'
 import { logger } from '../../logger'
 import { getSystemPrompt } from '../../../lib/llm-prompt'
 import { getSession } from '../../../db/hermes/session-store'
-import { getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from '../hermes-profile'
+import { getActiveProfileName, listProfileNamesFromDisk } from '../hermes-profile'
+import { gatewayRegistryService } from '../gateway-registry'
 import { AgentBridgeClient } from '../agent-bridge'
 import { handleApiRun, resolveRunSource, loadSessionStateFromDb, resolveSessionBoundRunConfig } from './handle-api-run'
 import { handleBridgeRun } from './handle-bridge-run'
@@ -22,6 +23,20 @@ import { handleSessionCommand, isSessionCommand, parseSessionCommand } from './s
 import type { ContentBlock, QueuedRun, SessionState } from './types'
 
 export type { ContentBlock } from './types'
+
+export function isKnownRunProfile(profile: string): boolean {
+  const normalized = profile || 'default'
+  if (normalized === 'default') return true
+  if (listProfileNamesFromDisk().includes(normalized)) return true
+  try {
+    return gatewayRegistryService.listGateways().some((gateway: any) =>
+      gateway.profile === normalized || gateway.id === normalized,
+    )
+  } catch (err) {
+    logger.warn(err, '[chat-run-socket] failed to read gateway registry profiles')
+    return false
+  }
+}
 
 export class ChatRunSocket {
   private nsp: ReturnType<Server['of']>
@@ -58,16 +73,12 @@ export class ChatRunSocket {
   private onConnection(socket: Socket) {
     const socketProfile = (socket.handshake.query?.profile as string) || 'default'
     const currentProfile = () => getActiveProfileName() || socketProfile || 'default'
-    const profileExists = (profile: string) => {
-      if (!profile || profile === 'default') return true
-      return listProfileNamesFromDisk().includes(profile)
-    }
     const resolveRunProfile = (sessionId?: string, requested?: string) => {
       const requestedProfile = typeof requested === 'string' ? requested.trim() : ''
-      if (requestedProfile && profileExists(requestedProfile)) return requestedProfile
+      if (requestedProfile && isKnownRunProfile(requestedProfile)) return requestedProfile
       if (!sessionId) return currentProfile()
       const storedProfile = getSession(sessionId)?.profile || ''
-      return storedProfile && profileExists(storedProfile) ? storedProfile : currentProfile()
+      return storedProfile && isKnownRunProfile(storedProfile) ? storedProfile : currentProfile()
     }
 
     socket.on('run', async (data: {

@@ -7,6 +7,7 @@ export interface GatewayRegistryEntry {
   profile: string
   type: GatewayRegistryType
   displayName: string
+  provider?: string
   upstream?: string
   apiKeyEnv?: string
   defaultModel?: string

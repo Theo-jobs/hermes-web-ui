@@ -20,6 +20,11 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { copyToClipboard } from "@/utils/clipboard";
 import { filterSessionsForProfileWithFallback } from "./session-profile-filter";
+import {
+  buildGatewayTargetOptions,
+  getModelGroupsForGatewayTarget,
+  type GatewayTargetOption,
+} from "./gateway-target-options";
 import FolderPicker from "./FolderPicker.vue";
 import ChatInput from "./ChatInput.vue";
 import ConversationMonitorPane from "./ConversationMonitorPane.vue";
@@ -61,8 +66,36 @@ const showSessions = ref(
 let mobileQuery: MediaQueryList | null = null;
 const isMobile = ref(false);
 
+function gatewayTargetForSession(session: Session): GatewayTargetOption | null {
+  if (session.spaceId) {
+    const exactSpace = gatewayTargetOptions.value.find((option) => option.spaceId === session.spaceId);
+    if (exactSpace) return exactSpace;
+  }
+  const provider = session.provider || "";
+  const model = session.model || "";
+  return (
+    gatewayTargetOptions.value.find((option) =>
+      option.profile === (session.profile || "default") &&
+      (!provider || option.provider === provider) &&
+      (!model || option.model === model || option.defaultModel === model),
+    ) ||
+    gatewayTargetOptions.value.find((option) => option.profile === (session.profile || "default")) ||
+    null
+  );
+}
+
 function handleSessionClick(sessionId: string) {
-  chatStore.switchSession(sessionId);
+  const session = chatStore.sessions.find((item) => item.id === sessionId);
+  const target = session ? gatewayTargetForSession(session) : null;
+  void chatStore.switchToSessionWithGatewayContext(sessionId, target
+    ? {
+      profile: target.profile,
+      spaceId: target.spaceId,
+      model: session?.model || target.defaultModel || target.model || null,
+      provider: session?.provider || target.provider || null,
+      source: target.source,
+    }
+    : undefined);
   if (mobileQuery?.matches) showSessions.value = false;
 }
 
@@ -116,6 +149,7 @@ const visibleSessions = computed(() =>
   filterSessionsForProfileWithFallback(
     chatStore.sessions,
     chatStore.nextSessionProfile,
+    chatStore.nextSessionSpaceId,
   ),
 );
 
@@ -159,12 +193,6 @@ const headerTitle = computed(() =>
 );
 
 
-const gatewayById = computed(() => {
-  const map = new Map<string, (typeof gatewayRegistry.gateways)[number]>();
-  for (const gateway of gatewayRegistry.gateways) map.set(gateway.id, gateway);
-  return map;
-});
-
 const gatewayByProfile = computed(() => {
   const map = new Map<string, (typeof gatewayRegistry.gateways)[number]>();
   for (const gateway of gatewayRegistry.gateways) map.set(gateway.profile, gateway);
@@ -179,45 +207,108 @@ const spaceByProfile = computed(() => {
   return map;
 });
 
-const gatewayTargetOptions = computed(() => {
-  const seen = new Set<string>();
-  const options = gatewayRegistry.spaces.map((space) => {
-    seen.add(space.profile);
-    const gateway = gatewayById.value.get(space.gatewayId);
-    return {
-      label: `${space.displayName} / ${gateway?.displayName || space.profile}`,
-      value: space.id,
-    };
-  });
-  for (const gateway of gatewayRegistry.gateways) {
-    if (seen.has(gateway.profile)) continue;
-    options.push({
-      label: `${gateway.displayName || gateway.id} / ${gateway.profile}`,
-      value: `profile:${gateway.profile}`,
-    });
-  }
-  return options;
-});
+const gatewayTargetOptions = computed<GatewayTargetOption[]>(() =>
+  buildGatewayTargetOptions({
+    gateways: gatewayRegistry.gateways,
+    spaces: gatewayRegistry.spaces,
+    fallbackProfile: profilesStore.activeProfileName || chatStore.nextSessionProfile || "default",
+    profileModelGroups: appStore.profileModelGroups,
+    globalModelGroups: appStore.modelGroups,
+    customModels: appStore.customModels,
+    selectedProvider: appStore.selectedProvider,
+    selectedModel: appStore.selectedModel,
+  }),
+);
+
+const gatewayTargetSelectOptions = computed(() =>
+  gatewayTargetOptions.value.map((option) => ({
+    label: option.label,
+    value: option.value,
+  })),
+);
+const showGatewayTargetModal = ref(false);
+const gatewayTargetSearch = ref("");
+const gatewayTargetTypeOrder = ["local", "remote", "custom", "fallback"];
+const gatewayTypeLabel = (type: string) =>
+  type === "local"
+    ? t("gateways.typeLocal")
+    : type === "remote"
+      ? t("gateways.typeRemote")
+      : type === "fallback"
+        ? t("chat.gatewayTargetFallback")
+        : t("gateways.typeCustom");
 
 const selectedGatewayTarget = computed({
   get() {
+    const targetSpaceId = chatStore.nextSessionSpaceId;
+    if (targetSpaceId && gatewayTargetOptions.value.some((option) => option.value === targetSpaceId)) {
+      return targetSpaceId;
+    }
+    const targetProfile = chatStore.nextSessionProfile || "default";
+    const targetProvider = chatStore.nextSessionProvider || "";
+    const targetModel = chatStore.nextSessionModel || "";
+    const exactTarget = gatewayTargetOptions.value.find((option) =>
+      !option.spaceId &&
+      option.profile === targetProfile &&
+      (!targetProvider || option.provider === targetProvider) &&
+      (!targetModel || option.model === targetModel || option.defaultModel === targetModel),
+    );
+    if (exactTarget) return exactTarget.value;
     return (
-      chatStore.nextSessionSpaceId ||
-      `profile:${chatStore.nextSessionProfile || "default"}`
+      gatewayTargetOptions.value.find((option) => option.profile === targetProfile)?.value ||
+      `profile:${targetProfile}`
     );
   },
   set(value: string) {
-    const space = gatewayRegistry.spaces.find((item) => item.id === value);
-    const profile = space?.profile || value.replace(/^profile:/, "") || "default";
-    const gateway = gatewayByProfile.value.get(profile);
-    chatStore.setNextSessionGateway({
-      profile,
-      spaceId: space?.id || null,
-      model: gateway?.defaultModel || null,
-    });
-    void chatStore.switchToMostRecentSessionForProfile(profile);
+    void selectGatewayTarget(value);
   },
 });
+
+function findGatewayTargetOption(value: string): GatewayTargetOption | null {
+  return gatewayTargetOptions.value.find((option) => option.value === value) || null;
+}
+
+const selectedGatewayTargetOption = computed(() =>
+  findGatewayTargetOption(selectedGatewayTarget.value) || gatewayTargetOptions.value[0] || null,
+);
+
+const filteredGatewayTargets = computed(() => {
+  const query = gatewayTargetSearch.value.trim().toLowerCase();
+  if (!query) return gatewayTargetOptions.value;
+  return gatewayTargetOptions.value.filter((option) =>
+    option.searchText.includes(query) ||
+    option.label.toLowerCase().includes(query),
+  );
+});
+
+const groupedGatewayTargets = computed(() => {
+  const groups = new Map<string, GatewayTargetOption[]>();
+  for (const option of filteredGatewayTargets.value) {
+    const key = option.gatewayType || "custom";
+    groups.set(key, [...(groups.get(key) || []), option]);
+  }
+  return [...groups.entries()]
+    .sort((a, b) => gatewayTargetTypeOrder.indexOf(a[0]) - gatewayTargetTypeOrder.indexOf(b[0]))
+    .map(([type, items]) => ({ type, label: gatewayTypeLabel(type), items }));
+});
+
+function openGatewayTargetPicker() {
+  gatewayTargetSearch.value = "";
+  showGatewayTargetModal.value = true;
+}
+
+async function selectGatewayTarget(value: string) {
+  const target = findGatewayTargetOption(value);
+  if (!target) return;
+  await chatStore.switchToGatewayTargetSession({
+    profile: target.profile,
+    spaceId: target.spaceId,
+    model: target.defaultModel || target.model || null,
+    provider: target.provider || null,
+    source: target.source,
+  });
+  showGatewayTargetModal.value = false;
+}
 
 const activeGateway = computed(() =>
   gatewayByProfile.value.get(chatStore.activeSession?.profile || ""),
@@ -245,6 +336,7 @@ const activeApproval = computed(() => chatStore.activePendingApproval);
 const visibleApproval = computed(() => activeApproval.value);
 const showNewChatModal = ref(false);
 const newChatProfile = ref<string>("default");
+const newChatTarget = ref<string>("");
 const newChatProvider = ref<string>("");
 const newChatModel = ref<string>("");
 const newChatLoading = ref(false);
@@ -275,15 +367,23 @@ function getDefaultModelForProfile(profile: string) {
   };
 }
 
-const newChatProfileOptions = computed(() =>
-  (profilesStore.profiles.length > 0 ? profilesStore.profiles : [{ name: "default" }]).map((profile) => ({
-    label: profile.name,
-    value: profile.name,
-  })),
+const newChatTargetOption = computed(() =>
+  findGatewayTargetOption(newChatTarget.value) || selectedGatewayTargetOption.value,
 );
 
 const newChatModelGroups = computed(() => {
-  return getModelGroupsForProfile(newChatProfile.value);
+  const target = newChatTargetOption.value;
+  if (!target) return getModelGroupsForProfile(newChatProfile.value);
+  return getModelGroupsForGatewayTarget({
+    profile: target.profile,
+    defaultModel: target.defaultModel,
+    defaultProvider: target.provider,
+    profileModelGroups: appStore.profileModelGroups,
+    globalModelGroups: appStore.modelGroups,
+    customModels: appStore.customModels,
+    selectedProvider: appStore.selectedProvider,
+    selectedModel: appStore.selectedModel,
+  });
 });
 
 const newChatProviderOptions = computed(() =>
@@ -304,9 +404,22 @@ const newChatModelOptions = computed(() => {
 });
 
 function syncNewChatModelSelection() {
-  const defaults = getDefaultModelForProfile(newChatProfile.value);
-  newChatProvider.value = defaults.provider;
-  newChatModel.value = defaults.model;
+  const target = newChatTargetOption.value;
+  newChatProfile.value = target?.profile || newChatProfile.value || "default";
+  const targetProvider = target?.provider || "";
+  const targetModel = target?.defaultModel || target?.model || "";
+  const providerGroup = targetProvider
+    ? newChatModelGroups.value.find((group) => group.provider === targetProvider)
+    : undefined;
+  const modelGroup = targetModel
+    ? newChatModelGroups.value.find((group) => group.models.includes(targetModel))
+    : undefined;
+  const fallbackGroup = providerGroup || modelGroup || newChatModelGroups.value.find((group) => group.models.length > 0);
+  newChatProvider.value = providerGroup?.provider || modelGroup?.provider || fallbackGroup?.provider || "";
+  const selectedGroup = modelGroup || fallbackGroup;
+  newChatModel.value = targetModel && selectedGroup?.models.includes(targetModel)
+    ? targetModel
+    : fallbackGroup?.models[0] || "";
 }
 
 async function openNewChatModal() {
@@ -317,19 +430,19 @@ async function openNewChatModal() {
     if (appStore.modelGroups.length === 0 && appStore.profileModelGroups.length === 0) {
       await appStore.loadModels();
     }
-    newChatProfile.value =
-      profilesStore.activeProfileName ||
-      profilesStore.profiles.find((profile) => profile.active)?.name ||
-      profilesStore.profiles[0]?.name ||
-      "default";
+    if (gatewayRegistry.gateways.length === 0 && !gatewayRegistry.loading) {
+      await gatewayRegistry.fetchAll();
+    }
+    newChatTarget.value = selectedGatewayTarget.value;
+    newChatProfile.value = newChatTargetOption.value?.profile || "default";
     syncNewChatModelSelection();
   } finally {
     newChatLoading.value = false;
   }
 }
 
-function handleNewChatProfileChange(value: string) {
-  newChatProfile.value = value;
+function handleNewChatTargetChange(value: string) {
+  newChatTarget.value = value;
   syncNewChatModelSelection();
 }
 
@@ -339,10 +452,13 @@ function handleNewChatProviderChange(value: string) {
 }
 
 function confirmNewChat() {
+  const target = newChatTargetOption.value;
   chatStore.newChat({
-    profile: newChatProfile.value,
+    profile: target?.profile || newChatProfile.value,
+    spaceId: target?.spaceId || null,
     provider: newChatProvider.value,
     model: newChatModel.value,
+    source: target?.source,
   });
   showNewChatModal.value = false;
 }
@@ -855,6 +971,25 @@ async function handleSessionModelCustomSubmit() {
           </NButton>
         </div>
       </div>
+      <div v-if="showSessions" class="session-gateway-compact" data-testid="chat-session-gateway-switcher">
+        <button
+          class="session-gateway-trigger"
+          type="button"
+          data-testid="gateway-switch-trigger"
+          @click="openGatewayTargetPicker"
+        >
+          <span class="session-gateway-copy">
+            <span class="session-gateway-kicker">{{ t("chat.gatewayTarget") }}</span>
+            <span class="session-gateway-name">{{ selectedGatewayTargetOption?.displayName || "default" }}</span>
+            <span class="session-gateway-meta">
+              {{ selectedGatewayTargetOption?.gatewayName || "default" }} · {{ selectedGatewayTargetOption?.profile || "default" }}
+            </span>
+          </span>
+          <svg class="session-gateway-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </button>
+      </div>
       <div v-if="showSessions" class="session-profile-filter">
         <NSelect
           :value="sessionProfileFilter || '__all__'"
@@ -1069,12 +1204,13 @@ async function handleSessionModelCustomSubmit() {
     >
       <div class="new-chat-form">
         <label class="new-chat-field">
-          <span class="new-chat-label">{{ t("sidebar.profiles") }}</span>
+          <span class="new-chat-label">{{ t("chat.gatewayTarget") }}</span>
           <NSelect
-            :value="newChatProfile"
-            :options="newChatProfileOptions"
+            :value="newChatTarget"
+            :options="gatewayTargetSelectOptions"
             :loading="newChatLoading || profilesStore.loading"
-            @update:value="handleNewChatProfileChange"
+            filterable
+            @update:value="handleNewChatTargetChange"
           />
         </label>
         <label class="new-chat-field">
@@ -1101,13 +1237,75 @@ async function handleSessionModelCustomSubmit() {
           <NButton @click="showNewChatModal = false">{{ t("common.cancel") }}</NButton>
           <NButton
             type="primary"
-            :disabled="!newChatProfile || !newChatProvider || !newChatModel"
+            :disabled="!newChatTargetOption || !newChatProvider || !newChatModel"
             @click="confirmNewChat"
           >
             {{ t("chat.newChat") }}
           </NButton>
         </div>
       </template>
+    </NModal>
+
+    <NModal
+      v-model:show="showGatewayTargetModal"
+      preset="card"
+      :title="t('chat.gatewayTargetPickerTitle')"
+      :style="{ width: 'min(520px, calc(100vw - 32px))' }"
+      :mask-closable="true"
+      data-testid="gateway-switch-menu"
+    >
+      <NInput
+        v-model:value="gatewayTargetSearch"
+        :placeholder="t('chat.gatewayTargetSearch')"
+        clearable
+        size="small"
+        class="gateway-target-search"
+      />
+      <div class="gateway-target-picker-list">
+        <div v-for="group in groupedGatewayTargets" :key="group.type" class="gateway-target-picker-group">
+          <div class="gateway-target-picker-heading">
+            <span>{{ group.label }}</span>
+            <span>{{ group.items.length }}</span>
+          </div>
+          <button
+            v-for="option in group.items"
+            :key="option.value"
+            type="button"
+            class="gateway-target-picker-row"
+            :class="{ active: option.value === selectedGatewayTarget }"
+            :data-gateway-profile="option.profile"
+            :data-gateway-target="option.value"
+            @click="selectGatewayTarget(option.value)"
+          >
+            <span class="gateway-target-picker-main">
+              <span class="gateway-target-picker-name">{{ option.displayName }}</span>
+              <span class="gateway-target-picker-meta">
+                {{ option.gatewayName }} · {{ option.profile }}
+              </span>
+            </span>
+            <span class="gateway-target-picker-model">
+              {{ option.model || t("common.notConfigured") }}
+            </span>
+            <svg
+              v-if="option.value === selectedGatewayTarget"
+              class="gateway-target-picker-check"
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+          </button>
+        </div>
+        <div v-if="groupedGatewayTargets.length === 0" class="gateway-target-picker-empty">
+          {{ t("chat.gatewayTargetEmpty") }}
+        </div>
+      </div>
     </NModal>
 
     <div class="chat-main">
@@ -1156,16 +1354,20 @@ async function handleSessionModelCustomSubmit() {
           <!-- chat/live mode toggle hidden -->
           <template v-if="currentMode === 'chat'">
             <div class="gateway-target-control">
-              <span class="gateway-target-label">Next chat</span>
-              <NSelect
-                v-model:value="selectedGatewayTarget"
-                size="small"
-                :options="gatewayTargetOptions"
-                :loading="gatewayRegistry.loading"
-                :disabled="gatewayTargetOptions.length === 0"
-                :consistent-menu-width="false"
-                class="gateway-target-select"
-              />
+              <span class="gateway-target-label">{{ t("chat.gatewayTarget") }}</span>
+              <button
+                class="gateway-target-header-trigger"
+                type="button"
+                data-testid="gateway-switch-trigger"
+                :disabled="gatewayRegistry.loading || gatewayTargetOptions.length === 0"
+                @click="openGatewayTargetPicker"
+              >
+                <span class="gateway-target-header-main">{{ selectedGatewayTargetOption?.displayName || "default" }}</span>
+                <span class="gateway-target-header-sub">{{ selectedGatewayTargetOption?.model || activeModelLabel }}</span>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
             </div>
             <NTooltip trigger="hover">
               <template #trigger>
@@ -1657,6 +1859,162 @@ async function handleSessionModelCustomSubmit() {
   margin: 0 8px 10px;
 }
 
+.session-gateway-compact {
+  margin: 0 8px 10px;
+}
+
+.session-gateway-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid $border-color;
+  border-radius: $radius-sm;
+  background: $bg-card;
+  color: $text-primary;
+  padding: 8px 9px;
+  text-align: left;
+  cursor: pointer;
+  transition: all $transition-fast;
+
+  &:hover {
+    border-color: $accent-primary;
+    background: $bg-card-hover;
+  }
+}
+
+.session-gateway-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.session-gateway-kicker {
+  font-size: 10px;
+  line-height: 1.1;
+  color: $text-muted;
+}
+
+.session-gateway-name {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-gateway-meta {
+  font-size: 10px;
+  color: $text-muted;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-gateway-chevron {
+  flex: 0 0 auto;
+  color: $text-muted;
+}
+
+.gateway-target-search {
+  margin-bottom: 12px;
+}
+
+.gateway-target-picker-list {
+  max-height: 55vh;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.gateway-target-picker-group {
+  margin-bottom: 8px;
+}
+
+.gateway-target-picker-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 4px 5px;
+  color: $text-muted;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.gateway-target-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 48px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: $radius-sm;
+  background: transparent;
+  color: $text-primary;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color $transition-fast;
+
+  &:hover {
+    background: $bg-secondary;
+  }
+
+  &.active {
+    background: rgba(var(--accent-primary-rgb), 0.1);
+  }
+}
+
+.gateway-target-picker-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.gateway-target-picker-name,
+.gateway-target-picker-meta,
+.gateway-target-picker-model {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-target-picker-name {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.gateway-target-picker-meta {
+  color: $text-muted;
+  font-size: 11px;
+}
+
+.gateway-target-picker-model {
+  max-width: 140px;
+  color: $text-secondary;
+  font-family: $font-code;
+  font-size: 11px;
+}
+
+.gateway-target-picker-check {
+  flex: 0 0 auto;
+  color: $accent-primary;
+}
+
+.gateway-target-picker-empty {
+  padding: 28px 0;
+  color: $text-muted;
+  font-size: 13px;
+  text-align: center;
+}
+
 .new-chat-form {
   display: flex;
   flex-direction: column;
@@ -1980,6 +2338,51 @@ async function handleSessionModelCustomSubmit() {
   width: 230px;
 }
 
+.gateway-target-header-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 260px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid $border-color;
+  border-radius: $radius-sm;
+  background: $bg-card;
+  color: $text-primary;
+  cursor: pointer;
+  transition: all $transition-fast;
+
+  &:hover:not(:disabled) {
+    border-color: $accent-primary;
+    background: $bg-card-hover;
+  }
+
+  &:disabled {
+    color: $text-muted;
+    cursor: not-allowed;
+  }
+}
+
+.gateway-target-header-main,
+.gateway-target-header-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-target-header-main {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.gateway-target-header-sub {
+  max-width: 90px;
+  color: $text-muted;
+  font-family: $font-code;
+  font-size: 10px;
+}
+
 .chat-mode-toggle {
   display: flex;
   align-items: center;
@@ -2062,6 +2465,12 @@ async function handleSessionModelCustomSubmit() {
 
   .gateway-target-select {
     width: 100%;
+  }
+
+  .gateway-target-header-trigger {
+    width: 100%;
+    max-width: none;
+    justify-content: space-between;
   }
 }
 

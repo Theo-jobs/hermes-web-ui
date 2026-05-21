@@ -22,6 +22,8 @@ const getActiveProfileNameMock = vi.fn()
 const loggerWarnMock = vi.fn()
 const getCompressionSnapshotMock = vi.fn()
 const useLocalSessionStoreMock = vi.fn()
+const listGatewayRegistryMock = vi.fn()
+const listGatewaySpacesMock = vi.fn()
 
 vi.mock('../../packages/server/src/db/hermes/conversations-db', () => ({
   listConversationSummariesFromDb: listConversationSummariesFromDbMock,
@@ -88,6 +90,13 @@ vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
   listProfileNamesFromDisk: () => ['default', 'travel'],
 }))
 
+vi.mock('../../packages/server/src/services/hermes/gateway-registry', () => ({
+  gatewayRegistryService: {
+    listGateways: listGatewayRegistryMock,
+    listSpaces: listGatewaySpacesMock,
+  },
+}))
+
 vi.mock('../../packages/server/src/db/hermes/compression-snapshot', () => ({
   getCompressionSnapshot: getCompressionSnapshotMock,
 }))
@@ -131,6 +140,10 @@ describe('session conversations controller', () => {
     getCompressionSnapshotMock.mockReset()
     useLocalSessionStoreMock.mockReset()
     useLocalSessionStoreMock.mockReturnValue(true)
+    listGatewayRegistryMock.mockReset()
+    listGatewayRegistryMock.mockReturnValue([])
+    listGatewaySpacesMock.mockReset()
+    listGatewaySpacesMock.mockReturnValue([])
   })
 
   it('lists conversations from the local session store', async () => {
@@ -174,6 +187,38 @@ describe('session conversations controller', () => {
     const mod = await import('../../packages/server/src/controllers/hermes/sessions')
     const ctx: any = { query: { humanOnly: 'false' }, body: null }
     await expect(mod.listConversations(ctx)).rejects.toThrow('db unavailable')
+  })
+
+  it('lists local store sessions for disk and registered gateway profiles', async () => {
+    listGatewayRegistryMock.mockReturnValue([
+      { id: 'hefeng', profile: 'hefeng', provider: 'custom:hefeng', defaultModel: 'hefeng-model', spaceId: 'hefeng-work' },
+      { id: 'minion59', profile: 'minion59', spaceId: 'minion59-work' },
+    ])
+    localListSessionsMock.mockReturnValue([
+      { id: 'default-chat', profile: 'default', source: 'api_server' },
+      { id: 'travel-chat', profile: 'travel', source: 'cli' },
+      { id: 'hefeng-chat', profile: 'hefeng', source: 'api_server' },
+      { id: 'minion-chat', profile: 'minion59', source: 'api_server' },
+      { id: 'stale-chat', profile: 'deleted-profile', source: 'api_server' },
+      { id: 'tool-chat', profile: 'hefeng', source: 'tool' },
+    ])
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { query: {}, body: null }
+    await mod.list(ctx)
+
+    expect(localListSessionsMock).toHaveBeenCalledWith(undefined, undefined, 2000)
+    expect(ctx.body.sessions.map((session: any) => session.id)).toEqual([
+      'default-chat',
+      'travel-chat',
+      'hefeng-chat',
+      'minion-chat',
+    ])
+    expect(ctx.body.sessions.find((session: any) => session.id === 'hefeng-chat')).toMatchObject({
+      provider: 'custom:hefeng',
+      model: 'hefeng-model',
+      space_id: 'hefeng-work',
+    })
   })
 
   it('gets conversation messages from the local session store', async () => {

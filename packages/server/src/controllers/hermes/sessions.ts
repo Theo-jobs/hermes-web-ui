@@ -15,6 +15,7 @@ import { deleteUsage, getUsage, getUsageBatch, getLocalUsageStats } from '../../
 import type { UsageStatsModelRow, UsageStatsDailyRow } from '../../db/hermes/usage-store'
 import { getModelContextLength } from '../../services/hermes/model-context'
 import { getActiveProfileName, listProfileNamesFromDisk } from '../../services/hermes/hermes-profile'
+import { gatewayRegistryService } from '../../services/hermes/gateway-registry'
 import { isPathWithin } from '../../services/hermes/hermes-path'
 import { getGroupChatServer } from '../../routes/hermes/group-chat'
 import { logger } from '../../services/logger'
@@ -32,6 +33,52 @@ function filterPendingDeletedSessions<T extends { id: string }>(items: T[]): T[]
 
 function filterPendingDeletedConversationSummaries(items: ConversationSummary[]): ConversationSummary[] {
   return filterPendingDeletedSessions(items)
+}
+
+function listKnownSessionProfiles(): Set<string> {
+  const profiles = new Set(listProfileNamesFromDisk().map(profile => profile || 'default'))
+  try {
+    for (const gateway of gatewayRegistryService.listGateways()) {
+      if (gateway.profile) profiles.add(gateway.profile)
+    }
+  } catch (err) {
+    logger.warn(err, 'Hermes Session: failed to read gateway registry profiles')
+  }
+  return profiles
+}
+
+function enrichGatewaySessionMetadata<T extends { profile?: string | null; provider?: string | null; model?: string | null; space_id?: string | null }>(sessions: T[]): T[] {
+  let gateways: ReturnType<typeof gatewayRegistryService.listGateways> = []
+  let spaces: ReturnType<typeof gatewayRegistryService.listSpaces> = []
+  try {
+    gateways = gatewayRegistryService.listGateways()
+    spaces = gatewayRegistryService.listSpaces()
+  } catch (err) {
+    logger.warn(err, 'Hermes Session: failed to read gateway registry metadata')
+    return sessions
+  }
+
+  const gatewayByProfile = new Map(gateways.map(gateway => [gateway.profile || 'default', gateway]))
+  const spaceByProfile = new Map<string, string>()
+  for (const space of spaces) {
+    if (!spaceByProfile.has(space.profile || 'default')) spaceByProfile.set(space.profile || 'default', space.id)
+  }
+  for (const gateway of gateways) {
+    const profile = gateway.profile || 'default'
+    if (gateway.spaceId && !spaceByProfile.has(profile)) spaceByProfile.set(profile, gateway.spaceId)
+  }
+
+  return sessions.map(session => {
+    const profile = session.profile || 'default'
+    const gateway = gatewayByProfile.get(profile)
+    const spaceId = session.space_id || spaceByProfile.get(profile) || null
+    return {
+      ...session,
+      space_id: spaceId,
+      provider: session.provider || gateway?.provider || '',
+      model: session.model || gateway?.defaultModel || '',
+    }
+  })
 }
 
 interface HermesDeleteResult {
@@ -144,13 +191,12 @@ export async function list(ctx: any) {
   const effectiveLimit = limit && limit > 0 ? limit : 2000
 
   const allSessions = localListSessions(profile, source, effectiveLimit)
-  const knownProfiles = profile ? null : new Set(listProfileNamesFromDisk())
-  ctx.body = {
-    sessions: filterPendingDeletedSessions(allSessions.filter(s =>
+  const knownProfiles = profile ? null : listKnownSessionProfiles()
+  const sessions = allSessions.filter(s =>
       (s.source === 'api_server' || s.source === 'cli') &&
       (!knownProfiles || knownProfiles.has(s.profile || 'default')),
-    )),
-  }
+    )
+  ctx.body = { sessions: enrichGatewaySessionMetadata(filterPendingDeletedSessions(sessions)) }
 }
 
 /**

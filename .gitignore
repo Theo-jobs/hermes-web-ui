@@ -43,5 +43,8 @@ hermes-dependencies.md
 *.sw?
 .superpowers/
 CLAUDE.md
+# Local agent task records and rollback snapshots
+.agent-tasks/
+.update-backups/
 # Client source map artifacts
 packages/client/src/**/*.js

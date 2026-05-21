@@ -23,12 +23,14 @@ const gatewayRegistry = useGatewayRegistryStore()
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/
 
 type GatewayForm = {
   id: string
   displayName: string
   profile: string
   type: GatewayRegistryType
+  provider: string
   upstream: string
   defaultModel: string
   spaceId: string
@@ -52,6 +54,7 @@ const editingSpaceId = ref<string | null>(null)
 const savingGateway = ref(false)
 const savingSpace = ref(false)
 const testingGatewayId = ref<string | null>(null)
+const gatewaySearch = ref('')
 
 const gatewayById = computed(() =>
   new Map(gatewayRegistry.gateways.map(gateway => [gateway.id, gateway])),
@@ -69,6 +72,62 @@ const spacesByGateway = computed(() => {
 
 const orphanSpaces = computed(() =>
   gatewayRegistry.spaces.filter(space => !gatewayById.value.has(space.gatewayId)),
+)
+
+const localGatewayCount = computed(() =>
+  gatewayRegistry.gateways.filter(gateway => gateway.type === 'local').length,
+)
+
+const remoteGatewayCount = computed(() =>
+  gatewayRegistry.gateways.filter(gateway => gateway.type === 'remote' || gateway.type === 'custom').length,
+)
+
+function gatewayTypeText(type?: GatewayRegistryType) {
+  if (type === 'local') return t('gateways.typeLocal')
+  if (type === 'remote') return t('gateways.typeRemote')
+  return t('gateways.typeCustom')
+}
+
+function gatewayEndpointLabel(gateway: GatewayRegistryEntry) {
+  if (gateway.upstream) return t('gateways.endpointConfigured')
+  if (gateway.type === 'local') return t('gateways.endpointLocal')
+  return t('gateways.endpointNotConfigured')
+}
+
+function gatewaySearchText(gateway: GatewayRegistryEntry) {
+  const spaces = gatewayRegistry.spaces.filter(space => space.gatewayId === gateway.id)
+  return [
+    gateway.id,
+    gateway.displayName,
+    gateway.profile,
+    gateway.type,
+    gateway.provider,
+    gateway.defaultModel,
+    gateway.spaceId,
+    ...spaces.flatMap(space => [space.id, space.displayName, space.profile]),
+  ].filter(Boolean).join(' ').toLowerCase()
+}
+
+const filteredGateways = computed(() => {
+  const query = gatewaySearch.value.trim().toLowerCase()
+  if (!query) return gatewayRegistry.gateways
+  return gatewayRegistry.gateways.filter(gateway => gatewaySearchText(gateway).includes(query))
+})
+
+const filteredOrphanSpaces = computed(() => {
+  const query = gatewaySearch.value.trim().toLowerCase()
+  if (!query) return orphanSpaces.value
+  return orphanSpaces.value.filter(space =>
+    [space.id, space.displayName, space.gatewayId, space.profile]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase()
+      .includes(query),
+  )
+})
+
+const isFilteredEmpty = computed(() =>
+  !!gatewaySearch.value.trim() && filteredGateways.value.length === 0 && filteredOrphanSpaces.value.length === 0,
 )
 
 const gatewayTypeOptions = computed(() => [
@@ -90,6 +149,7 @@ function emptyGatewayForm(): GatewayForm {
     displayName: '',
     profile: '',
     type: 'custom',
+    provider: '',
     upstream: '',
     defaultModel: '',
     spaceId: '',
@@ -128,6 +188,7 @@ function openEditGateway(gateway: GatewayRegistryEntry) {
     displayName: gateway.displayName || '',
     profile: gateway.profile || gateway.id,
     type: gateway.type || 'custom',
+    provider: gateway.provider || '',
     upstream: gateway.upstream || '',
     defaultModel: gateway.defaultModel || '',
     spaceId: gateway.spaceId || '',
@@ -165,6 +226,9 @@ function validateGatewayForm() {
   if (gatewayForm.apiKeyEnv.trim() && !ENV_PATTERN.test(gatewayForm.apiKeyEnv.trim())) {
     throw new Error(t('gateways.invalidEnv'))
   }
+  if (gatewayForm.provider.trim() && !PROVIDER_PATTERN.test(gatewayForm.provider.trim())) {
+    throw new Error(t('gateways.invalidProvider'))
+  }
   if (gatewayForm.upstream.trim()) {
     const url = new URL(gatewayForm.upstream.trim())
     if (!['http:', 'https:'].includes(url.protocol)) throw new Error(t('gateways.invalidUpstream'))
@@ -192,6 +256,7 @@ async function saveGateway() {
       displayName: gatewayForm.displayName.trim() || gatewayForm.id.trim(),
       profile: gatewayForm.profile.trim(),
       type: gatewayForm.type,
+      provider: gatewayForm.provider.trim() || undefined,
       upstream: gatewayForm.upstream.trim() || undefined,
       defaultModel: gatewayForm.defaultModel.trim() || undefined,
       spaceId: gatewayForm.spaceId.trim() || undefined,
@@ -307,25 +372,54 @@ onMounted(() => {
         {{ t('gateways.secretHint') }}
       </NAlert>
 
+      <section class="gateway-directory-toolbar">
+        <div class="gateway-directory-copy">
+          <div class="gateway-directory-title">{{ t('gateways.directoryTitle') }}</div>
+          <div class="gateway-directory-subtitle">
+            {{ t('gateways.directorySubtitle', { count: gatewayRegistry.gateways.length }) }}
+          </div>
+        </div>
+        <div class="gateway-directory-stats">
+          <NTag size="small">{{ t('gateways.totalCount', { count: gatewayRegistry.gateways.length }) }}</NTag>
+          <NTag size="small" type="success">{{ t('gateways.localCount', { count: localGatewayCount }) }}</NTag>
+          <NTag size="small" type="info">{{ t('gateways.remoteCount', { count: remoteGatewayCount }) }}</NTag>
+        </div>
+        <NInput
+          v-model:value="gatewaySearch"
+          clearable
+          class="gateway-search"
+          :placeholder="t('gateways.searchPlaceholder')"
+        />
+      </section>
+
       <NSpin :show="gatewayRegistry.loading && gatewayRegistry.gateways.length === 0 && gatewayRegistry.spaces.length === 0">
         <NEmpty
           v-if="!gatewayRegistry.loading && gatewayRegistry.gateways.length === 0 && gatewayRegistry.spaces.length === 0"
           :description="t('gateways.empty')"
         />
 
+        <NEmpty
+          v-else-if="isFilteredEmpty"
+          :description="t('gateways.searchEmpty')"
+        />
+
         <div v-else class="gateway-list">
-          <section v-for="gateway in gatewayRegistry.gateways" :key="gateway.id" class="gateway-card">
+          <section v-for="gateway in filteredGateways" :key="gateway.id" class="gateway-card">
             <div class="gateway-main">
               <div>
-                <div class="gateway-title">{{ gateway.displayName || gateway.id }}</div>
+                <div class="gateway-title-line">
+                  <div class="gateway-title">{{ gateway.displayName || gateway.id }}</div>
+                  <NTag size="small" :type="gateway.type === 'local' ? 'success' : gateway.type === 'remote' ? 'info' : 'default'">
+                    {{ gatewayTypeText(gateway.type) }}
+                  </NTag>
+                </div>
                 <div class="gateway-meta">
                   <span>{{ t('gateways.id') }}: {{ gateway.id }}</span>
                   <span>{{ t('gateways.profile') }}: {{ gateway.profile }}</span>
-                  <span>{{ t('gateways.type') }}: {{ gateway.type }}</span>
-                  <span v-if="gateway.upstream">{{ t('gateways.upstream') }}: {{ gateway.upstream }}</span>
+                  <span>{{ t('gateways.endpoint') }}: {{ gatewayEndpointLabel(gateway) }}</span>
+                  <span v-if="gateway.provider">{{ t('gateways.provider') }}: {{ gateway.provider }}</span>
                   <span v-if="gateway.defaultModel">{{ t('gateways.defaultModel') }}: {{ gateway.defaultModel }}</span>
                   <span v-if="gateway.spaceId">{{ t('gateways.spaceId') }}: {{ gateway.spaceId }}</span>
-                  <span v-if="gateway.apiKeyEnv">{{ t('gateways.apiKeyEnv') }}: {{ gateway.apiKeyEnv }}</span>
                 </div>
               </div>
               <div class="gateway-tags">
@@ -372,10 +466,10 @@ onMounted(() => {
             <div v-else class="empty-spaces">{{ t('gateways.noSpaces') }}</div>
           </section>
 
-          <section v-if="orphanSpaces.length" class="gateway-card">
+          <section v-if="filteredOrphanSpaces.length" class="gateway-card">
             <div class="gateway-title">{{ t('gateways.orphanSpaces') }}</div>
             <div class="space-list">
-              <div v-for="space in orphanSpaces" :key="space.id" class="space-row">
+              <div v-for="space in filteredOrphanSpaces" :key="space.id" class="space-row">
                 <div class="space-copy">
                   <span class="space-name">{{ space.displayName }}</span>
                   <span class="space-meta">{{ t('gateways.spaceId') }}: {{ space.id }}</span>
@@ -425,6 +519,9 @@ onMounted(() => {
           </SettingRow>
           <SettingRow :label="t('gateways.type')" :hint="t('gateways.typeHint')">
             <NSelect v-model:value="gatewayForm.type" :options="gatewayTypeOptions" />
+          </SettingRow>
+          <SettingRow :label="t('gateways.provider')" :hint="t('gateways.providerHint')">
+            <NInput v-model:value="gatewayForm.provider" placeholder="custom:nas" />
           </SettingRow>
         </section>
 
@@ -527,6 +624,41 @@ onMounted(() => {
   margin-bottom: 16px;
 }
 
+.gateway-directory-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 320px);
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid $border-light;
+  border-radius: $radius-lg;
+  background: $bg-card;
+}
+
+.gateway-directory-title {
+  color: $text-primary;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.gateway-directory-subtitle {
+  margin-top: 3px;
+  color: $text-muted;
+  font-size: 12px;
+}
+
+.gateway-directory-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.gateway-search {
+  width: 100%;
+}
+
 .gateway-list {
   display: flex;
   flex-direction: column;
@@ -551,6 +683,13 @@ onMounted(() => {
   font-size: 16px;
   font-weight: 600;
   color: $text-primary;
+}
+
+.gateway-title-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .gateway-meta,
@@ -663,14 +802,17 @@ onMounted(() => {
 
 @media (max-width: $breakpoint-mobile) {
   .gateway-main,
-  .page-header {
+  .page-header,
+  .gateway-directory-toolbar {
+    display: flex;
     align-items: stretch;
     flex-direction: column;
   }
 
   .header-actions,
   .gateway-tags,
-  .space-actions {
+  .space-actions,
+  .gateway-directory-stats {
     justify-content: flex-start;
   }
 

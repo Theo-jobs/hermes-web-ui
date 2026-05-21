@@ -16,6 +16,7 @@ export const useGatewayRegistryStore = defineStore('gateway-registry', () => {
   const gateways = ref<GatewayRegistryEntry[]>([])
   const spaces = ref<SpaceRegistryEntry[]>([])
   const loading = ref(false)
+  const loaded = ref(false)
   const error = ref('')
 
   const gatewayLabelByProfile = computed(() => {
@@ -40,6 +41,7 @@ export const useGatewayRegistryStore = defineStore('gateway-registry', () => {
       error.value = err?.message || 'failed to load gateway registry'
       throw err
     } finally {
+      loaded.value = true
       loading.value = false
     }
   }
@@ -73,6 +75,7 @@ export const useGatewayRegistryStore = defineStore('gateway-registry', () => {
     gateways,
     spaces,
     loading,
+    loaded,
     error,
     gatewayLabelByProfile,
     fetchAll,

@@ -65,6 +65,33 @@ describe('gateway registry service', () => {
       profile: 'bad-secret',
       apiKey: 'dummy-secret',
     })).toThrow(/raw secrets/)
+    expect(() => gatewayRegistryService.upsertGateway({
+      id: 'bad-provider',
+      profile: 'bad-provider',
+      provider: 'custom provider',
+    })).toThrow(/provider/)
+  })
+
+  it('preserves provider, default model, and space binding when upserting gateways', () => {
+    const gateway = gatewayRegistryService.upsertGateway({
+      id: 'remote-hefeng',
+      profile: 'hefeng',
+      type: 'remote',
+      displayName: 'Hefeng',
+      provider: 'custom:hefeng',
+      defaultModel: 'hefeng-model',
+      spaceId: 'hefeng-work',
+      upstream: 'https://example.test',
+    })
+
+    expect(gateway).toMatchObject({
+      id: 'remote-hefeng',
+      profile: 'hefeng',
+      type: 'remote',
+      provider: 'custom:hefeng',
+      defaultModel: 'hefeng-model',
+      spaceId: 'hefeng-work',
+    })
+    expect(readFileSync(join(stateDir, 'gateways.json'), 'utf-8')).toContain('"provider": "custom:hefeng"')
   })
 })
-

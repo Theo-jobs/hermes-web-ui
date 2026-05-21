@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { NButton, NModal, NSpin, useMessage } from 'naive-ui'
+import { NButton, NInput, NModal, NSpin, useMessage } from 'naive-ui'
 import { useProfilesStore } from '@/stores/hermes/profiles'
+import { useAppStore } from '@/stores/hermes/app'
+import { useChatStore } from '@/stores/hermes/chat'
+import { useGatewayRegistryStore } from '@/stores/hermes/gateway-registry'
+import { buildGatewayTargetOptions, type GatewayTargetOption } from '@/components/hermes/chat/gateway-target-options'
 import {
   fetchProfileRuntimeStatuses,
   restartProfileGateway,
@@ -12,18 +16,23 @@ import {
 } from '@/api/hermes/profiles'
 import ProfileAvatarView from '@/components/hermes/profiles/ProfileAvatar.vue'
 import { useI18n } from 'vue-i18n'
+import { useRouter } from 'vue-router'
 
 const { t } = useI18n()
 const message = useMessage()
+const router = useRouter()
 const profilesStore = useProfilesStore()
+const appStore = useAppStore()
+const chatStore = useChatStore()
+const gatewayRegistry = useGatewayRegistryStore()
 
 const activeName = computed(() => profilesStore.activeProfileName ?? '')
 const displayName = computed(() => activeName.value || 'default')
-const activeProfile = computed(() => profilesStore.profiles.find(profile => profile.name === displayName.value))
 const runtimeStatuses = ref<ProfileRuntimeStatus[]>([])
 const runtimeLoading = ref(false)
 const showProfileModal = ref(false)
 const showAvatarModal = ref(false)
+const gatewaySearch = ref('')
 const editingProfile = ref<HermesProfile | null>(null)
 const avatarSaving = ref(false)
 const fileInputRef = ref<HTMLInputElement | null>(null)
@@ -31,6 +40,38 @@ const gatewayRestarting = ref<Record<string, boolean>>({})
 const profileRestarting = ref<Record<string, boolean>>({})
 const profileSwitching = ref<Record<string, boolean>>({})
 const statusByProfile = computed(() => new Map(runtimeStatuses.value.map(status => [status.profile, status])))
+const gatewayTargets = computed<GatewayTargetOption[]>(() =>
+  buildGatewayTargetOptions({
+    gateways: gatewayRegistry.gateways,
+    spaces: gatewayRegistry.spaces,
+    fallbackProfile: activeName.value || 'default',
+    profileModelGroups: appStore.profileModelGroups,
+    globalModelGroups: appStore.modelGroups,
+    customModels: appStore.customModels,
+    selectedProvider: appStore.selectedProvider,
+    selectedModel: appStore.selectedModel,
+  }),
+)
+const filteredGatewayTargets = computed(() => {
+  const query = gatewaySearch.value.trim().toLowerCase()
+  if (!query) return gatewayTargets.value
+  return gatewayTargets.value.filter(target =>
+    target.searchText.includes(query) || target.label.toLowerCase().includes(query),
+  )
+})
+const selectedGatewayTarget = computed(() =>
+  gatewayTargets.value.find(targetMatchesSelection) || null,
+)
+const selectorProfileName = computed(() => selectedGatewayTarget.value?.profile || displayName.value)
+const selectorDisplayName = computed(() => selectedGatewayTarget.value?.displayName || displayName.value)
+const selectorDisplayMeta = computed(() =>
+  selectedGatewayTarget.value
+    ? `${selectedGatewayTarget.value.gatewayName} · ${selectedGatewayTarget.value.profile}`
+    : '',
+)
+const selectorProfileAvatar = computed(() =>
+  profilesStore.profiles.find(profile => profile.name === selectorProfileName.value)?.avatar,
+)
 
 async function loadRuntimeStatuses() {
   runtimeLoading.value = true
@@ -46,6 +87,12 @@ async function loadRuntimeStatuses() {
 function openProfileModal() {
   showProfileModal.value = true
   void loadRuntimeStatuses()
+  if (gatewayRegistry.gateways.length === 0 && !gatewayRegistry.loading) {
+    void gatewayRegistry.fetchAll()
+  }
+  if (appStore.modelGroups.length === 0 && appStore.profileModelGroups.length === 0) {
+    void appStore.loadModels()
+  }
 }
 
 function openAvatarModal(profile: HermesProfile) {
@@ -171,6 +218,37 @@ async function handleSwitchProfile(name: string) {
   }
 }
 
+async function handleGatewayTarget(target: GatewayTargetOption) {
+  await chatStore.switchToGatewayTargetSession({
+    profile: target.profile,
+    spaceId: target.spaceId,
+    model: target.defaultModel || target.model || null,
+    provider: target.provider || null,
+    source: target.source,
+  })
+  message.success(t('profiles.runtime.targetSelected', { name: target.displayName }))
+  showProfileModal.value = false
+  if (router.currentRoute.value.name !== 'hermes.chat') {
+    await router.push({ name: 'hermes.chat' }).catch(() => undefined)
+  }
+}
+
+function targetMatchesSelection(target: GatewayTargetOption) {
+  const selectedSpaceId = chatStore.nextSessionSpaceId
+  if (selectedSpaceId) return target.value === selectedSpaceId
+  const selectedProfile = chatStore.nextSessionProfile || activeName.value || 'default'
+  if (target.profile !== selectedProfile || target.spaceId) return false
+  const selectedProvider = chatStore.nextSessionProvider || ''
+  const selectedModel = chatStore.nextSessionModel || ''
+  if (selectedProvider && target.provider !== selectedProvider) return false
+  if (selectedModel && target.model !== selectedModel && target.defaultModel !== selectedModel) return false
+  return true
+}
+
+function isGatewayTargetActive(target: GatewayTargetOption) {
+  return targetMatchesSelection(target)
+}
+
 onMounted(() => {
   if (profilesStore.profiles.length === 0) {
     profilesStore.fetchProfiles()
@@ -182,8 +260,11 @@ onMounted(() => {
   <div class="profile-selector">
     <div class="selector-label">{{ t('sidebar.profiles') }}</div>
     <div class="profile-display" data-testid="profile-selector-select" @click="openProfileModal">
-      <ProfileAvatarView class="profile-avatar" :name="displayName" :avatar="activeProfile?.avatar" :size="24" />
-      <span class="profile-name">{{ displayName }}</span>
+      <ProfileAvatarView class="profile-avatar" :name="selectorProfileName" :avatar="selectorProfileAvatar" :size="24" />
+      <span class="profile-display-copy">
+        <span class="profile-name">{{ selectorDisplayName }}</span>
+        <span v-if="selectorDisplayMeta" class="profile-target-meta">{{ selectorDisplayMeta }}</span>
+      </span>
     </div>
 
     <NModal
@@ -277,6 +358,43 @@ onMounted(() => {
             </div>
           </div>
         </div>
+
+        <div class="gateway-runtime-section">
+          <div class="gateway-runtime-header">
+            <div>
+              <div class="gateway-runtime-title">{{ t('chat.gatewayTarget') }}</div>
+              <div class="gateway-runtime-subtitle">{{ t('profiles.runtime.gatewayTargetHint') }}</div>
+            </div>
+            <NInput
+              v-model:value="gatewaySearch"
+              size="small"
+              clearable
+              class="gateway-runtime-search"
+              :placeholder="t('chat.gatewayTargetSearch')"
+            />
+          </div>
+          <div class="gateway-runtime-list">
+            <button
+              v-for="target in filteredGatewayTargets"
+              :key="target.value"
+              class="gateway-runtime-item"
+              type="button"
+              :class="{ active: isGatewayTargetActive(target) }"
+              :data-gateway-profile="target.profile"
+              :data-gateway-target="target.value"
+              @click="handleGatewayTarget(target)"
+            >
+              <span class="gateway-runtime-main">
+                <span class="gateway-runtime-name">{{ target.displayName }}</span>
+                <span class="gateway-runtime-meta">{{ target.gatewayName }} · {{ target.profile }}</span>
+              </span>
+              <span class="gateway-runtime-model">{{ target.model || t('common.notConfigured') }}</span>
+            </button>
+            <div v-if="filteredGatewayTargets.length === 0" class="gateway-runtime-empty">
+              {{ t('chat.gatewayTargetEmpty') }}
+            </div>
+          </div>
+        </div>
       </NSpin>
     </NModal>
 
@@ -338,8 +456,8 @@ onMounted(() => {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  height: 34px;
-  padding: 4px 6px;
+  min-height: 40px;
+  padding: 5px 6px;
   border-radius: 8px;
   background: $bg-secondary;
   border: 1px solid $border-color;
@@ -350,6 +468,13 @@ onMounted(() => {
   background: $bg-card;
 }
 
+.profile-display-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
 .profile-name {
   min-width: 0;
   overflow: hidden;
@@ -358,6 +483,16 @@ onMounted(() => {
   font-size: 13px;
   font-weight: 600;
   color: $text-primary;
+}
+
+.profile-target-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  line-height: 13px;
+  color: $text-muted;
 }
 
 .profile-popover {
@@ -423,7 +558,7 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 420px;
+  max-height: 300px;
   min-height: 96px;
   overflow-y: auto;
 }
@@ -497,6 +632,105 @@ onMounted(() => {
   :deep(.n-button) {
     min-width: 88px;
   }
+}
+
+.gateway-runtime-section {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid $border-color;
+}
+
+.gateway-runtime-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.gateway-runtime-title {
+  color: $text-primary;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.gateway-runtime-subtitle,
+.gateway-runtime-meta,
+.gateway-runtime-empty {
+  color: $text-muted;
+  font-size: 12px;
+}
+
+.gateway-runtime-search {
+  width: 220px;
+  flex: 0 0 auto;
+}
+
+.gateway-runtime-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.gateway-runtime-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 46px;
+  padding: 8px 10px;
+  border: 1px solid $border-color;
+  border-radius: 8px;
+  background: $bg-card;
+  color: $text-primary;
+  text-align: left;
+  cursor: pointer;
+  transition: all $transition-fast;
+
+  &:hover {
+    border-color: $accent-muted;
+    background: $bg-card-hover;
+  }
+
+  &.active {
+    border-color: $accent-muted;
+    background: $bg-card-hover;
+  }
+}
+
+.gateway-runtime-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.gateway-runtime-name,
+.gateway-runtime-meta,
+.gateway-runtime-model {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-runtime-name {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.gateway-runtime-model {
+  max-width: 150px;
+  color: $text-secondary;
+  font-family: $font-code;
+  font-size: 11px;
+}
+
+.gateway-runtime-empty {
+  padding: 16px 0;
+  text-align: center;
 }
 
 .runtime-row {
@@ -592,6 +826,14 @@ onMounted(() => {
       --n-font-size: 12px !important;
       --n-padding: 0 8px !important;
     }
+  }
+
+  .gateway-runtime-header {
+    flex-direction: column;
+  }
+
+  .gateway-runtime-search {
+    width: 100%;
   }
 
   .avatar-editor-actions {

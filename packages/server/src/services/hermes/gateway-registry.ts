@@ -10,6 +10,7 @@ export interface GatewayRegistryEntry {
   profile: string
   type: GatewayRegistryType
   displayName: string
+  provider?: string
   upstream?: string
   apiKeyEnv?: string
   defaultModel?: string
@@ -36,6 +37,7 @@ const DEFAULT_GATEWAYS_FILE = 'gateways.json'
 const DEFAULT_SPACES_FILE = 'spaces.json'
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/
 
 function getStateDir(): string {
   return resolve(process.env.HERMES_WEB_UI_STATE_DIR || process.env.HERMES_WEB_UI_DATA_DIR || join(homedir(), '.hermes-web-ui'))
@@ -123,6 +125,10 @@ function normalizeGateway(input: unknown, existing?: GatewayRegistryEntry): Gate
   if (apiKeyEnv && !ENV_PATTERN.test(apiKeyEnv)) {
     throw new Error('apiKeyEnv must be an environment variable name')
   }
+  const provider = normalizeOptionalString(body.provider ?? existing?.provider, 'provider', 128)
+  if (provider && !PROVIDER_PATTERN.test(provider)) {
+    throw new Error('provider must be a provider key')
+  }
 
   const upstream = normalizeOptionalString(body.upstream ?? existing?.upstream, 'upstream')
   if (upstream) {
@@ -139,6 +145,7 @@ function normalizeGateway(input: unknown, existing?: GatewayRegistryEntry): Gate
     profile,
     type: typeRaw as GatewayRegistryType,
     displayName: normalizeOptionalString(body.displayName ?? existing?.displayName, 'displayName', 128) || id,
+    provider,
     upstream,
     apiKeyEnv,
     defaultModel: normalizeOptionalString(body.defaultModel ?? existing?.defaultModel, 'defaultModel', 256),

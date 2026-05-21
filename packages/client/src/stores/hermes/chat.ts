@@ -265,6 +265,7 @@ function mapHermesSession(s: SessionSummary): Session {
     endedAt: s.ended_at != null ? Math.round(s.ended_at * 1000) : null,
     lastActiveAt: s.last_active != null ? Math.round(s.last_active * 1000) : undefined,
     workspace: s.workspace || null,
+    spaceId: (s as any).space_id || (s as any).spaceId || null,
   }
 }
 
@@ -275,6 +276,8 @@ const MAX_PERSISTED_FOLLOWUPS = 80
 const NEXT_SESSION_PROFILE_KEY = 'hermes_next_session_profile'
 const NEXT_SESSION_SPACE_KEY = 'hermes_next_session_space'
 const NEXT_SESSION_MODEL_KEY = 'hermes_next_session_model'
+const NEXT_SESSION_PROVIDER_KEY = 'hermes_next_session_provider'
+const NEXT_SESSION_SOURCE_KEY = 'hermes_next_session_source'
 
 // 获取当前 profile 名称，用于隔离缓存。
 // 从 profiles store 的 activeProfileName（同步 localStorage）读取，
@@ -403,6 +406,10 @@ export const useChatStore = defineStore('chat', () => {
   const nextSessionProfile = ref<string>(localStorage.getItem(NEXT_SESSION_PROFILE_KEY) || getProfileName())
   const nextSessionSpaceId = ref<string | null>(localStorage.getItem(NEXT_SESSION_SPACE_KEY))
   const nextSessionModel = ref<string | null>(localStorage.getItem(NEXT_SESSION_MODEL_KEY))
+  const nextSessionProvider = ref<string | null>(localStorage.getItem(NEXT_SESSION_PROVIDER_KEY))
+  const nextSessionSource = ref<'cli' | 'api_server'>(
+    localStorage.getItem(NEXT_SESSION_SOURCE_KEY) === 'api_server' ? 'api_server' : 'cli',
+  )
   const focusMessageId = ref<string | null>(null)
   const streamStates = ref<Map<string, { abort: () => void }>>(new Map())
   /** sessionId → server-reported isWorking status */
@@ -517,13 +524,27 @@ export const useChatStore = defineStore('chat', () => {
 
       // Restore active session for the selected next gateway/profile.
       const targetProfile = nextSessionProfile.value || getProfileName() || 'default'
+      const targetSpaceId = nextSessionSpaceId.value || null
+      const isTargetSession = (s: Session) =>
+        (s.profile || 'default') === targetProfile && (!targetSpaceId || (s.spaceId || null) === targetSpaceId)
       const savedId = activeSessionId.value
       const savedForTarget = localStorage.getItem(profileStorageKey(targetProfile))
-      const targetId = savedId && sessions.value.some(s => s.id === savedId && (s.profile || 'default') === targetProfile)
+      let targetId = savedId && sessions.value.some(s => s.id === savedId && isTargetSession(s))
         ? savedId
-        : savedForTarget && sessions.value.some(s => s.id === savedForTarget && (s.profile || 'default') === targetProfile)
+        : savedForTarget && sessions.value.some(s => s.id === savedForTarget && isTargetSession(s))
           ? savedForTarget
-          : sessions.value.find(s => (s.profile || 'default') === targetProfile)?.id || sessions.value[0]?.id
+          : findGatewayTargetSession(targetProfile, targetSpaceId)?.id
+      if (!targetId && (targetSpaceId || targetProfile !== (getProfileName() || 'default'))) {
+        const draft = createSession({
+          profile: targetProfile,
+          model: nextSessionModel.value || undefined,
+          provider: nextSessionProvider.value || undefined,
+          source: nextSessionSource.value,
+          spaceId: targetSpaceId,
+        })
+        targetId = draft.id
+      }
+      targetId = targetId || sessions.value[0]?.id
       if (targetId) {
         await switchSession(targetId)
       } else {
@@ -557,19 +578,21 @@ export const useChatStore = defineStore('chat', () => {
   }
 
 
-  function createSession(options: { profile?: string; model?: string; provider?: string } = {}): Session {
+  function createSession(options: { profile?: string; spaceId?: string | null; model?: string; provider?: string; source?: 'cli' | 'api_server' } = {}): Session {
     const profile = options.profile || nextSessionProfile.value || useProfilesStore().activeProfileName || 'default'
     const session: Session = {
       id: uid(),
       profile,
       title: '',
-      spaceId: profile === nextSessionProfile.value ? nextSessionSpaceId.value : null,
-      source: 'cli',
+      spaceId: options.spaceId !== undefined
+        ? options.spaceId
+        : profile === nextSessionProfile.value ? nextSessionSpaceId.value : null,
+      source: options.source || (profile === nextSessionProfile.value ? nextSessionSource.value : 'cli'),
       messages: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
       model: options.model || (profile === nextSessionProfile.value ? nextSessionModel.value || undefined : undefined),
-      provider: options.provider || '',
+      provider: options.provider || (profile === nextSessionProfile.value ? nextSessionProvider.value || '' : ''),
     }
     sessions.value.unshift(session)
     return session
@@ -597,12 +620,13 @@ export const useChatStore = defineStore('chat', () => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       model: nextSessionModel.value || undefined,
+      provider: nextSessionProvider.value || '',
     }
     sessions.value.unshift(session)
     return session
   }
 
-  function setNextSessionGateway(target: { profile: string; spaceId?: string | null; model?: string | null }) {
+  function setNextSessionGateway(target: { profile: string; spaceId?: string | null; model?: string | null; provider?: string | null; source?: 'cli' | 'api_server' }, options: { rebindActiveDraft?: boolean } = {}) {
     const profile = target.profile || 'default'
     nextSessionProfile.value = profile
     nextSessionSpaceId.value = target.spaceId || null
@@ -618,27 +642,153 @@ export const useChatStore = defineStore('chat', () => {
     } else {
       localStorage.removeItem(NEXT_SESSION_MODEL_KEY)
     }
+    nextSessionProvider.value = target.provider || null
+    if (nextSessionProvider.value) {
+      localStorage.setItem(NEXT_SESSION_PROVIDER_KEY, nextSessionProvider.value)
+    } else {
+      localStorage.removeItem(NEXT_SESSION_PROVIDER_KEY)
+    }
+    nextSessionSource.value = target.source === 'api_server' ? 'api_server' : 'cli'
+    localStorage.setItem(NEXT_SESSION_SOURCE_KEY, nextSessionSource.value)
+
+    const shouldRebindActiveDraft = options.rebindActiveDraft ?? true
+    if (!shouldRebindActiveDraft) return
 
     const session = activeSession.value
-    if (!session || session.messages.length > 0 || isSessionLive(session.id)) return
+    if (!session || sessionHasHistory(session) || isSessionLive(session.id)) return
     session.profile = profile
     session.spaceId = nextSessionSpaceId.value
     if (target.model) {
       session.model = target.model
     }
+    if (target.provider) {
+      session.provider = target.provider
+    }
+    if (target.source) {
+      session.source = target.source
+    }
   }
 
 
-  async function switchToMostRecentSessionForProfile(profile: string): Promise<boolean> {
-    const targetProfile = profile || 'default'
-    const savedForTarget = localStorage.getItem(profileStorageKey(targetProfile))
-    const candidates = sessions.value.filter(s => (s.profile || 'default') === targetProfile)
-    const targetId = savedForTarget && candidates.some(s => s.id === savedForTarget)
-      ? savedForTarget
-      : candidates.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]?.id
-    if (!targetId) return false
-    await switchSession(targetId)
+  function sessionHasHistory(session: Session): boolean {
+    return (session.messageCount || 0) > 0 || (session.messages?.length || 0) > 0 || Boolean(session.title?.trim())
+  }
+
+  function sameSpace(session: Session, spaceId?: string | null): boolean {
+    return (session.spaceId || null) === (spaceId || null)
+  }
+
+  function sortByRecent(items: Session[]): Session[] {
+    return [...items].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+  }
+
+  function matchesGatewayProviderModel(session: Session, target?: { provider?: string | null; model?: string | null }): boolean {
+    const provider = target?.provider || ''
+    const model = target?.model || ''
+    if (provider && session.provider !== provider) return false
+    if (model && session.model !== model) return false
     return true
+  }
+
+  function findGatewayTargetSession(
+    profile: string,
+    spaceId?: string | null,
+    target?: { provider?: string | null; model?: string | null },
+  ): Session | null {
+    const targetProfile = profile || 'default'
+    const requestedSpaceId = spaceId || null
+    const profileCandidates = sessions.value.filter(s => (s.profile || 'default') === targetProfile)
+
+    if (requestedSpaceId) {
+      const exactHistory = sortByRecent(
+        profileCandidates.filter(s => sameSpace(s, requestedSpaceId) && sessionHasHistory(s)),
+      )
+      if (exactHistory[0]) return exactHistory[0]
+
+      const legacyHistory = sortByRecent(
+        profileCandidates.filter(s => sameSpace(s, null) && sessionHasHistory(s)),
+      )
+      if (legacyHistory[0]) return legacyHistory[0]
+
+      const exactDraft = sortByRecent(profileCandidates.filter(s => sameSpace(s, requestedSpaceId)))
+      if (exactDraft[0]) return exactDraft[0]
+
+      return null
+    }
+
+    const providerModelScoped = !!(target?.provider || target?.model)
+    const gatewayCandidates = providerModelScoped
+      ? profileCandidates.filter(s => matchesGatewayProviderModel(s, target))
+      : profileCandidates
+    const profileHistory = sortByRecent(gatewayCandidates.filter(sessionHasHistory))
+    if (profileHistory[0]) return profileHistory[0]
+    return sortByRecent(gatewayCandidates)[0] || null
+  }
+
+  async function switchToMostRecentSessionForGateway(
+    profile: string,
+    spaceId?: string | null,
+    targetConfig?: { provider?: string | null; model?: string | null },
+  ): Promise<boolean> {
+    const session = findGatewayTargetSession(profile, spaceId, targetConfig)
+    if (!session) return false
+    await switchSession(session.id)
+    return true
+  }
+
+  async function switchToGatewayTargetSession(target: { profile: string; spaceId?: string | null; model?: string | null; provider?: string | null; source?: 'cli' | 'api_server' }): Promise<boolean> {
+    const profile = target.profile || 'default'
+    setNextSessionGateway(target, { rebindActiveDraft: false })
+    const switched = await switchToMostRecentSessionForGateway(profile, target.spaceId || null, {
+      provider: target.spaceId ? null : target.provider,
+      model: target.spaceId ? null : target.model,
+    })
+    if (switched) {
+      const session = activeSession.value
+      if (session) {
+        if (target.model && !session.model) session.model = target.model
+        if (target.provider && !session.provider) session.provider = target.provider
+        if (target.source && !sessionHasHistory(session)) session.source = target.source
+      }
+      return true
+    }
+
+    const draft = createSession({
+      profile,
+      spaceId: target.spaceId || null,
+      model: target.model || undefined,
+      provider: target.provider || undefined,
+      source: target.source || 'cli',
+    })
+    await switchSession(draft.id)
+    return true
+  }
+
+  async function switchToMostRecentSessionForProfile(profile: string): Promise<boolean> {
+    return switchToMostRecentSessionForGateway(profile, null)
+  }
+
+  async function switchToSessionWithGatewayContext(
+    sessionId: string,
+    target?: { profile?: string | null; spaceId?: string | null; model?: string | null; provider?: string | null; source?: string | null },
+  ) {
+    const session = sessions.value.find(s => s.id === sessionId) || null
+    const profile = target?.profile || session?.profile || 'default'
+    const source = target?.source === 'api_server' || session?.source === 'api_server' ? 'api_server' : 'cli'
+    setNextSessionGateway({
+      profile,
+      spaceId: target?.spaceId ?? session?.spaceId ?? null,
+      model: target?.model ?? session?.model ?? null,
+      provider: target?.provider ?? session?.provider ?? null,
+      source,
+    }, { rebindActiveDraft: false })
+    if (session) {
+      session.source = source
+      if (target?.spaceId !== undefined) session.spaceId = target.spaceId
+      if (target?.model && !session.model) session.model = target.model
+      if (target?.provider && !session.provider) session.provider = target.provider
+    }
+    await switchSession(sessionId)
   }
 
   async function switchSession(sessionId: string, focusId?: string | null) {
@@ -750,12 +900,14 @@ export const useChatStore = defineStore('chat', () => {
     resumeServerWorkingRun(sessionId)
   }
 
-  function newChat(options: { profile?: string; model?: string; provider?: string } = {}) {
+  function newChat(options: { profile?: string; spaceId?: string | null; model?: string; provider?: string; source?: 'cli' | 'api_server' } = {}) {
     const appStore = useAppStore()
     const session = createSession({
       profile: options.profile,
+      spaceId: options.spaceId,
       model: options.model || appStore.selectedModel || undefined,
       provider: options.provider || appStore.selectedProvider || '',
+      source: options.source,
     })
     switchSession(session.id)
   }
@@ -1153,18 +1305,29 @@ export const useChatStore = defineStore('chat', () => {
       const currentSession = sessions.value.find(s => s.id === sid) || activeSession.value
       const sessionModel = currentSession?.model || appStore.selectedModel
       const sessionProvider = currentSession?.provider || appStore.selectedProvider
+      const modelGroups = appStore.modelGroups.map(group => ({
+        provider: group.provider,
+        models: [...group.models],
+      }))
+      for (const [provider, models] of Object.entries(appStore.customModels)) {
+        const group = modelGroups.find(item => item.provider === provider)
+        if (group) group.models = [...new Set([...group.models, ...models])]
+        else modelGroups.push({ provider, models: [...models] })
+      }
+      if (sessionProvider && sessionModel) {
+        const group = modelGroups.find(item => item.provider === sessionProvider)
+        if (group && !group.models.includes(sessionModel)) group.models.push(sessionModel)
+        if (!group) modelGroups.push({ provider: sessionProvider, models: [sessionModel] })
+      }
       const runPayload = {
         input,
         session_id: sid,
         profile: currentSession?.profile || nextSessionProfile.value || undefined,
-        model: shouldSendInitialSessionConfig ? sessionModel || undefined : undefined,
-        provider: shouldSendInitialSessionConfig ? sessionProvider || undefined : undefined,
-        model_groups: appStore.modelGroups.map(group => ({
-          provider: group.provider,
-          models: group.models,
-        })),
+        model: (shouldSendInitialSessionConfig || sessionModel) ? sessionModel || undefined : undefined,
+        provider: (shouldSendInitialSessionConfig || sessionProvider) ? sessionProvider || undefined : undefined,
+        model_groups: modelGroups,
         queue_id: userMsg.id,
-        source: 'cli' as const,
+        source: currentSession?.source === 'api_server' ? 'api_server' as const : 'cli' as const,
       }
       if (shouldSendInitialSessionConfig && activeSession.value) {
         activeSession.value.messageCount = Math.max(activeSession.value.messageCount || 0, 1)
@@ -2181,6 +2344,8 @@ export const useChatStore = defineStore('chat', () => {
     nextSessionProfile,
     nextSessionSpaceId,
     nextSessionModel,
+    nextSessionProvider,
+    nextSessionSource,
     focusMessageId,
     messages,
     isStreaming,
@@ -2211,6 +2376,9 @@ export const useChatStore = defineStore('chat', () => {
     newCliSession,
     setNextSessionGateway,
     switchToMostRecentSessionForProfile,
+    switchToMostRecentSessionForGateway,
+    switchToGatewayTargetSession,
+    switchToSessionWithGatewayContext,
     switchSession,
     switchSessionModel,
     addOrUpdateSession,

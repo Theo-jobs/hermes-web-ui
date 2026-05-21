@@ -8,6 +8,7 @@ import { useAppStore } from '@/stores/hermes/app'
 import { useProfilesStore } from '@/stores/hermes/profiles'
 import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
 import { formatTimestampMs } from '@/shared/session-display'
+import { getModelGroupsForGatewayTarget } from './gateway-target-options'
 
 const props = withDefaults(defineProps<{
   session: Session
@@ -43,10 +44,22 @@ const profileName = computed(() => props.session.profile || 'default')
 const profileAvatar = computed(() => profilesStore.profiles.find(profile => profile.name === profileName.value)?.avatar)
 const profileHasModels = computed(() => {
   const profileModels = appStore.profileModelGroups.find(profile => profile.profile === profileName.value)
-  return !!profileModels?.groups?.some(group => group.models.length > 0)
+  if (profileModels?.groups?.some(group => group.models.length > 0)) return true
+  const gateway = gatewayRegistry.gateways.find(item => item.profile === profileName.value)
+  if (!gateway) return false
+  return getModelGroupsForGatewayTarget({
+    profile: profileName.value,
+    defaultModel: gateway.defaultModel,
+    defaultProvider: gateway.provider,
+    profileModelGroups: appStore.profileModelGroups,
+    globalModelGroups: appStore.modelGroups,
+    customModels: appStore.customModels,
+    selectedProvider: appStore.selectedProvider,
+    selectedModel: appStore.selectedModel,
+  }).some(group => group.models.length > 0)
 })
 const profileModelsMissing = computed(() =>
-  appStore.profileModelGroups.length > 0 && !profileHasModels.value,
+  appStore.profileModelGroups.length > 0 && gatewayRegistry.loaded && !gatewayRegistry.loading && !profileHasModels.value,
 )
 
 let longPressTimer: ReturnType<typeof setTimeout> | null = null

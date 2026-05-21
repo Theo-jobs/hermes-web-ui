@@ -23,6 +23,7 @@ export interface SessionSummary {
   actual_cost_usd: number | null
   cost_status: string
   workspace?: string | null
+  space_id?: string | null
 }
 
 export interface SessionDetail extends SessionSummary {

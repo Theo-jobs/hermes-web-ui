@@ -1,15 +1,20 @@
 import type { AvailableModelGroup, ProfileAvailableModels } from '@/api/hermes/system'
-import type { GatewayRegistryEntry, SpaceRegistryEntry } from '@/api/hermes/gateway-registry'
+import type { GatewayRegistryEntry, GatewayRegistryType, SpaceRegistryEntry } from '@/api/hermes/gateway-registry'
+
+export type GatewayTargetRunSource = 'cli' | 'api_server'
 
 export type GatewayTargetOption = {
   label: string
   value: string
   displayName: string
   gatewayName: string
+  gatewayType: GatewayRegistryType | 'fallback'
+  source: GatewayTargetRunSource
   profile: string
   spaceId: string | null
   gatewayId: string | null
   defaultModel: string | null
+  searchText: string
   provider: string
   model: string
   fallback?: boolean
@@ -25,6 +30,7 @@ type ModelGroup = Pick<AvailableModelGroup, 'provider' | 'label' | 'models'>
 type TargetModelContext = {
   profile: string
   defaultModel?: string | null
+  defaultProvider?: string | null
   profileModelGroups: ProfileAvailableModels[]
   globalModelGroups: AvailableModelGroup[]
   customModels?: Record<string, string[]>
@@ -81,6 +87,10 @@ function addModelToProvider(groups: AvailableModelGroup[], provider: string, mod
   })
 }
 
+function gatewayRunSource(gateway?: GatewayRegistryEntry | null): GatewayTargetRunSource {
+  return gateway?.upstream || gateway?.type === 'remote' ? 'api_server' : 'cli'
+}
+
 export function getModelGroupsForGatewayTarget(ctx: TargetModelContext): AvailableModelGroup[] {
   const profileModels = ctx.profileModelGroups.find(entry => entry.profile === ctx.profile)
   const groups: AvailableModelGroup[] = []
@@ -102,12 +112,16 @@ export function getModelGroupsForGatewayTarget(ctx: TargetModelContext): Availab
   }
 
   const targetDefaultModel = ctx.defaultModel?.trim() || ''
+  const targetDefaultProvider = ctx.defaultProvider?.trim() || ''
   if (targetDefaultModel && !groups.some(group => group.models.includes(targetDefaultModel))) {
     addModelToProvider(
       groups,
-      profileDefaultProvider || selectedProvider || ctx.profile || 'custom',
+      targetDefaultProvider || profileDefaultProvider || selectedProvider || ctx.profile || 'custom',
       targetDefaultModel,
     )
+  }
+  if (targetDefaultProvider && targetDefaultModel) {
+    addModelToProvider(groups, targetDefaultProvider, targetDefaultModel)
   }
 
   return groups.filter(group => group.models.length > 0)
@@ -116,10 +130,27 @@ export function getModelGroupsForGatewayTarget(ctx: TargetModelContext): Availab
 export function resolveModelSelectionForGatewayTarget(ctx: TargetModelContext): ModelSelection {
   const groups = getModelGroupsForGatewayTarget(ctx)
   const profileModels = ctx.profileModelGroups.find(entry => entry.profile === ctx.profile)
+  const targetDefaultProvider = ctx.defaultProvider?.trim() || ''
+  const targetDefaultModel = ctx.defaultModel?.trim() || ''
+  const profileDefaultProvider = profileModels?.default_provider?.trim() || ''
+  const profileDefaultModel = profileModels?.default?.trim() || ''
+  const selectedProvider = ctx.selectedProvider?.trim() || ''
+  const selectedModel = ctx.selectedModel?.trim() || ''
+
+  const exactPairs = [
+    { provider: targetDefaultProvider, model: targetDefaultModel },
+    { provider: profileDefaultProvider, model: profileDefaultModel },
+  ]
+  for (const pair of exactPairs) {
+    if (!pair.provider || !pair.model) continue
+    const exactGroup = groups.find(group => group.provider === pair.provider && group.models.includes(pair.model))
+    if (exactGroup) return { provider: exactGroup.provider, model: pair.model }
+  }
+
   const preferredModels = [
-    ctx.defaultModel?.trim() || '',
-    profileModels?.default?.trim() || '',
-    ctx.selectedModel?.trim() || '',
+    targetDefaultModel,
+    profileDefaultModel,
+    selectedModel,
   ].filter(Boolean)
 
   for (const preferred of preferredModels) {
@@ -128,8 +159,9 @@ export function resolveModelSelectionForGatewayTarget(ctx: TargetModelContext): 
   }
 
   const preferredProviders = [
-    profileModels?.default_provider?.trim() || '',
-    ctx.selectedProvider?.trim() || '',
+    targetDefaultProvider,
+    profileDefaultProvider,
+    selectedProvider,
   ].filter(Boolean)
   for (const provider of preferredProviders) {
     const providerGroup = groups.find(group => group.provider === provider && group.models.length > 0)
@@ -144,15 +176,19 @@ export function buildGatewayTargetOption(params: {
   profile: string
   spaceId?: string | null
   gatewayId?: string | null
+  gatewayType?: GatewayRegistryType | 'fallback'
   label: string
   displayName?: string
   gatewayName?: string
+  source?: GatewayTargetRunSource
   defaultModel?: string | null
+  defaultProvider?: string | null
   fallback?: boolean
 } & Omit<TargetModelContext, 'profile' | 'defaultModel'>): GatewayTargetOption {
   const selection = resolveModelSelectionForGatewayTarget({
     profile: params.profile,
     defaultModel: params.defaultModel,
+    defaultProvider: params.defaultProvider,
     profileModelGroups: params.profileModelGroups,
     globalModelGroups: params.globalModelGroups,
     customModels: params.customModels,
@@ -163,11 +199,22 @@ export function buildGatewayTargetOption(params: {
     label: params.label,
     displayName: params.displayName || params.label,
     gatewayName: params.gatewayName || params.gatewayId || params.profile,
-    value: params.spaceId || `profile:${params.profile}`,
+    gatewayType: params.gatewayType || 'custom',
+    source: params.source || 'cli',
+    value: params.spaceId || (params.gatewayId ? `gateway:${params.gatewayId}` : `profile:${params.profile}`),
     profile: params.profile,
     spaceId: params.spaceId || null,
     gatewayId: params.gatewayId || null,
     defaultModel: params.defaultModel || null,
+    searchText: [
+      params.label,
+      params.displayName,
+      params.gatewayName,
+      params.gatewayId,
+      params.profile,
+      params.defaultModel,
+      params.defaultProvider,
+    ].filter(Boolean).join(' ').toLowerCase(),
     provider: selection.provider,
     model: selection.model,
     fallback: params.fallback,
@@ -176,20 +223,23 @@ export function buildGatewayTargetOption(params: {
 
 export function buildGatewayTargetOptions(ctx: TargetOptionContext): GatewayTargetOption[] {
   const gatewayById = new Map(ctx.gateways.map(gateway => [gateway.id, gateway]))
-  const seenProfiles = new Set<string>()
+  const seenGatewayIds = new Set<string>()
   const options: GatewayTargetOption[] = []
 
   for (const space of ctx.spaces) {
-    seenProfiles.add(space.profile)
+    seenGatewayIds.add(space.gatewayId)
     const gateway = gatewayById.get(space.gatewayId)
     options.push(buildGatewayTargetOption({
       profile: space.profile,
       spaceId: space.id,
       gatewayId: space.gatewayId,
+      gatewayType: gateway?.type || 'custom',
+      source: gatewayRunSource(gateway),
       label: `${space.displayName} / ${gateway?.displayName || gateway?.id || space.gatewayId || space.profile} / ${space.profile}`,
       displayName: space.displayName,
       gatewayName: gateway?.displayName || gateway?.id || space.gatewayId || space.profile,
       defaultModel: gateway?.defaultModel || null,
+      defaultProvider: gateway?.provider || null,
       profileModelGroups: ctx.profileModelGroups,
       globalModelGroups: ctx.globalModelGroups,
       customModels: ctx.customModels,
@@ -199,14 +249,17 @@ export function buildGatewayTargetOptions(ctx: TargetOptionContext): GatewayTarg
   }
 
   for (const gateway of ctx.gateways) {
-    if (seenProfiles.has(gateway.profile)) continue
+    if (seenGatewayIds.has(gateway.id)) continue
     options.push(buildGatewayTargetOption({
       profile: gateway.profile,
       gatewayId: gateway.id,
+      gatewayType: gateway.type || 'custom',
+      source: gatewayRunSource(gateway),
       label: `${gateway.displayName || gateway.id} / ${gateway.profile}`,
       displayName: gateway.displayName || gateway.id,
       gatewayName: gateway.displayName || gateway.id,
       defaultModel: gateway.defaultModel || null,
+      defaultProvider: gateway.provider || null,
       profileModelGroups: ctx.profileModelGroups,
       globalModelGroups: ctx.globalModelGroups,
       customModels: ctx.customModels,
@@ -222,6 +275,8 @@ export function buildGatewayTargetOptions(ctx: TargetOptionContext): GatewayTarg
       label: `${profile} / current default`,
       displayName: profile,
       gatewayName: 'current default',
+      gatewayType: 'fallback',
+      source: 'cli',
       fallback: true,
       profileModelGroups: ctx.profileModelGroups,
       globalModelGroups: ctx.globalModelGroups,
