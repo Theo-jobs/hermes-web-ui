@@ -56,6 +56,18 @@ describe('run-chat message formatting', () => {
     ])
   })
 
+  it('keeps persisted system errors visible when loading a session', () => {
+    const messages: SessionMessage[] = [
+      { id: 1, session_id: 's1', role: 'user', content: 'first', timestamp: 1 },
+      { id: 2, session_id: 's1', role: 'system', content: 'Bridge error: socket closed', timestamp: 2 },
+    ]
+
+    expect(handleMessage(messages, 's1').map(m => ({ role: m.role, content: m.content }))).toEqual([
+      { role: 'user', content: 'first' },
+      { role: 'system', content: 'Bridge error: socket closed' },
+    ])
+  })
+
   it('treats assistant tool-call messages as sendable even with empty text', () => {
     expect(isAssistantMessageSendable({
       content: '',

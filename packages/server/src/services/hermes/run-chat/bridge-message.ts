@@ -7,6 +7,43 @@ import { addMessage } from '../../../db/hermes/session-store'
 import { logger } from '../../logger'
 import type { SessionMessage, SessionState } from './types'
 
+const SECRET_VALUE = /(authorization\s*[:=]\s*bearer\s+)[^\s,;]+|((?:api[_-]?key|token|password|secret|cookie)\s*[:=]\s*)[^\s,;]+/gi
+
+export function sanitizeBridgeErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || 'Bridge run failed')
+  return message
+    .replace(SECRET_VALUE, (_match, bearerPrefix, secretPrefix) => `${bearerPrefix || secretPrefix}[REDACTED]`)
+    .trim() || 'Bridge run failed'
+}
+
+export function recordBridgeRunError(state: SessionState, sessionId: string, error: unknown, runMarker?: string): string {
+  const safeMessage = sanitizeBridgeErrorMessage(error)
+  const content = `Bridge error: ${safeMessage}`
+  if (runMarker) {
+    const existing = [...state.messages]
+      .reverse()
+      .find(m => m.runMarker === runMarker && m.role === 'system' && m.content === content)
+    if (existing) return safeMessage
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000)
+  const id = addMessage({
+    session_id: sessionId,
+    role: 'system',
+    content,
+    timestamp,
+  })
+  state.messages.push({
+    id: id || `bridge_error_${timestamp}_${state.messages.length}`,
+    session_id: sessionId,
+    runMarker,
+    role: 'system',
+    content,
+    timestamp,
+  })
+  return safeMessage
+}
+
 export function flushBridgePendingToDb(state: SessionState, sessionId: string, runMarker?: string) {
   const content = state.bridgePendingAssistantContent || ''
   const reasoning = state.bridgePendingReasoningContent || ''

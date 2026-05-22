@@ -101,7 +101,7 @@ export function handleMessage(messages: SessionMessage[], sid: string): any[] {
   let _messages = []
   try {
     _messages = messages
-      .filter(m => (m.role === 'user' || m.role === 'assistant' || m.role === 'tool' || m.role === 'command') && m.content !== undefined)
+      .filter(m => (m.role === 'user' || m.role === 'assistant' || m.role === 'tool' || m.role === 'command' || m.role === 'system') && m.content !== undefined)
       .map((m, idx, arr) => {
         const msg: any = {
           id: m.id,

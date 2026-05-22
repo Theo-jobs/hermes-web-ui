@@ -8,6 +8,17 @@ vi.mock('@/api/hermes/followups', () => ({
   generateFollowupSuggestions: vi.fn(),
 }))
 
+vi.mock('@/api/hermes/chat', () => ({
+  resumeSession: vi.fn((_sessionId: string, onResumed: any) => {
+    onResumed({ session_id: _sessionId, messages: [], isWorking: false, events: [] })
+    return { emit: vi.fn(), once: vi.fn() }
+  }),
+  registerSessionHandlers: vi.fn(),
+  unregisterSessionHandlers: vi.fn(),
+  getChatRunSocket: vi.fn(() => null),
+  startRunViaSocket: vi.fn(() => ({ abort: vi.fn() })),
+}))
+
 type PendingFollowup = {
   payload: any
   resolve: (value: { suggestions: string[], source: 'model' | 'fallback' }) => void
@@ -108,6 +119,35 @@ describe('chat store followups', () => {
     expect(secondStore.followupForSessionId).toBe('s1')
     expect(secondStore.followupForMessageId).toBe('a1')
     expect(secondStore.followupSuggestions).toEqual(['persisted next'])
+  })
+
+  it('shows persisted followups immediately when switching before resume returns messages', async () => {
+    const firstStore = useChatStore()
+    firstStore.addOrUpdateSession(session('s1', 'a1', 'instant answer'))
+    firstStore.activeSessionId = 's1'
+
+    const first = firstStore.refreshFollowups('s1')
+    pending[0].resolve({ suggestions: ['instant next'], source: 'model' })
+    await first
+
+    setActivePinia(createPinia())
+    const secondStore = useChatStore()
+    secondStore.addOrUpdateSession({
+      id: 's1',
+      title: 's1',
+      messages: [],
+      createdAt: 1,
+      updatedAt: 2,
+    })
+
+    const switched = secondStore.switchSession('s1')
+
+    expect(secondStore.followupForSessionId).toBe('s1')
+    expect(secondStore.followupForMessageId).toBe('a1')
+    expect(secondStore.followupSuggestions).toEqual(['instant next'])
+    expect(mockedGenerateFollowups).toHaveBeenCalledTimes(1)
+
+    await switched
   })
 
   it('updates gateway target on an empty draft session only', () => {

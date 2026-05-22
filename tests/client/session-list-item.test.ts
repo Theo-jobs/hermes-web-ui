@@ -10,7 +10,7 @@ vi.mock('vue-i18n', () => ({
   useI18n: () => ({ t: (key: string) => key }),
 }))
 
-function baseSession(profile: string) {
+function baseSession(profile: string, overrides: Record<string, unknown> = {}) {
   return {
     id: `${profile}-session`,
     profile,
@@ -21,13 +21,14 @@ function baseSession(profile: string) {
     model: 'gpt-5.5',
     provider: 'openai-codex',
     messageCount: 2,
+    ...overrides,
   }
 }
 
-function mountItem(profile: string) {
+function mountItem(profile: string, overrides: Record<string, unknown> = {}) {
   return mount(SessionListItem, {
     props: {
-      session: baseSession(profile) as any,
+      session: baseSession(profile, overrides) as any,
       active: false,
       pinned: false,
       canDelete: false,
@@ -69,6 +70,21 @@ describe('SessionListItem gateway model availability', () => {
 
   it('does not mark registered remote gateway sessions as missing models when global models are available', () => {
     const wrapper = mountItem('hefeng')
+
+    expect(wrapper.classes()).not.toContain('missing-models')
+    expect(wrapper.find('.session-item-warning').exists()).toBe(false)
+  })
+
+  it('keeps registered remote gateway sessions clean while model catalogs are refreshing', () => {
+    const appStore = useAppStore()
+    appStore.modelGroups = []
+    appStore.selectedProvider = ''
+    appStore.selectedModel = ''
+
+    const wrapper = mountItem('hefeng', {
+      provider: 'custom:hefeng',
+      model: 'gpt-5.5',
+    })
 
     expect(wrapper.classes()).not.toContain('missing-models')
     expect(wrapper.find('.session-item-warning').exists()).toBe(false)

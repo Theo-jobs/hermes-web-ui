@@ -112,17 +112,8 @@ export async function bootstrap() {
 
   const app = new Koa()
 
-  try {
-    agentBridgeManager = await startAgentBridgeManager()
-    console.log('[bootstrap] agent bridge started')
-  } catch (err) {
-    logger.warn(err, '[bootstrap] agent bridge failed to start')
-    console.warn('[bootstrap] agent bridge failed to start:', err instanceof Error ? err.message : err)
-  }
-  await new Promise(resolve => setTimeout(resolve, 1000))
   // Initialize all web-ui SQLite tables
   const { initAllStores } = await import('./db/hermes/init')
-  // Wait 1 second before initializing stores to ensure all resources are ready
   initAllStores()
   await new Promise(resolve => setTimeout(resolve, 1000))
   console.log('[bootstrap] all stores initialized')
@@ -159,6 +150,15 @@ export async function bootstrap() {
   server = listenResult.primary
   servers = listenResult.servers
   console.log('[bootstrap] app.listen called')
+
+  try {
+    agentBridgeManager = await startAgentBridgeManager()
+    console.log('[bootstrap] agent bridge started')
+  } catch (err) {
+    logger.warn(err, '[bootstrap] agent bridge failed to start')
+    console.warn('[bootstrap] agent bridge failed to start:', err instanceof Error ? err.message : err)
+  }
+  await new Promise(resolve => setTimeout(resolve, 1000))
 
   setupTerminalWebSocket(servers)
   setupKanbanEventsWebSocket(servers)

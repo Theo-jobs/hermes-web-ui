@@ -79,6 +79,15 @@ export interface Session {
   workspace?: string | null
 }
 
+type SessionRunSource = 'cli' | 'api_server'
+type SessionDraftOptions = {
+  profile?: string
+  spaceId?: string | null
+  model?: string
+  provider?: string
+  source?: SessionRunSource
+}
+
 type FollowupSource = 'model' | 'fallback'
 type FollowupStatus = 'loading' | 'ready' | 'error'
 
@@ -509,6 +518,37 @@ export const useChatStore = defineStore('chat', () => {
     activeFollowupKey.value = null
   }
 
+  function isDisplayableFollowup(entry: FollowupCacheEntry | undefined): entry is FollowupCacheEntry {
+    return !!entry
+      && (entry.status === 'ready' || entry.status === 'error')
+      && Array.isArray(entry.suggestions)
+      && entry.suggestions.length > 0
+  }
+
+  function activateCachedFollowupsForSession(sessionId: string, session?: Session | null): boolean {
+    const lastAssistant = session?.messages
+      ? [...session.messages].reverse().find(m => m.role === 'assistant' && !m.isStreaming && m.content.trim())
+      : null
+
+    if (lastAssistant) {
+      const key = followupCacheKey(sessionId, lastAssistant.id)
+      const cached = followupCache.value[key]
+      if (isDisplayableFollowup(cached) && cached.contentSignature === followupContentSignature(lastAssistant)) {
+        activeFollowupKey.value = key
+        return true
+      }
+      return false
+    }
+
+    const latestCached = Object.entries(followupCache.value)
+      .filter(([, entry]) => entry.sessionId === sessionId && isDisplayableFollowup(entry))
+      .sort(([, a], [, b]) => b.updatedAt - a.updatedAt)[0]
+
+    if (!latestCached) return false
+    activeFollowupKey.value = latestCached[0]
+    return true
+  }
+
   const activeSession = ref<Session | null>(null)
   const messages = computed<Message[]>(() => activeSession.value?.messages || [])
 
@@ -526,10 +566,19 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function loadSessions(profile?: string | null) {
+    const loadStartedAt = Date.now()
     isLoadingSessions.value = true
     try {
       const list = await fetchSessions(undefined, undefined, profile || undefined)
       const fresh = list.map(mapHermesSession)
+      const activeLocalSession = activeSession.value
+      const preserveActiveLocalSession = activeLocalSession
+        && !fresh.some(s => s.id === activeLocalSession.id)
+        && (
+          !sessionHasHistory(activeLocalSession)
+          || activeLocalSession.createdAt >= loadStartedAt
+          || isSessionLive(activeLocalSession.id)
+        )
       // Preserve already-loaded messages for sessions that are still present,
       // so we don't blow away the active session's messages on refresh.
       const msgsByIdBefore = new Map(sessions.value.map(s => [s.id, s.messages]))
@@ -537,7 +586,9 @@ export const useChatStore = defineStore('chat', () => {
         const prev = msgsByIdBefore.get(s.id)
         if (prev && prev.length) s.messages = prev
       }
-      sessions.value = fresh
+      sessions.value = preserveActiveLocalSession
+        ? [activeLocalSession, ...fresh]
+        : fresh
 
       // Restore active session for the selected next gateway/profile.
       const targetProfile = nextSessionProfile.value || getProfileName() || 'default'
@@ -595,7 +646,19 @@ export const useChatStore = defineStore('chat', () => {
   }
 
 
-  function createSession(options: { profile?: string; spaceId?: string | null; model?: string; provider?: string; source?: 'cli' | 'api_server' } = {}): Session {
+  function normalizeSessionSource(source?: string | null): SessionRunSource {
+    return source === 'api_server' ? 'api_server' : 'cli'
+  }
+
+  function hasExplicitDraftGateway(options: SessionDraftOptions): boolean {
+    return options.profile !== undefined
+      || options.spaceId !== undefined
+      || options.model !== undefined
+      || options.provider !== undefined
+      || options.source !== undefined
+  }
+
+  function createSession(options: SessionDraftOptions = {}): Session {
     const profile = options.profile || nextSessionProfile.value || useProfilesStore().activeProfileName || 'default'
     const session: Session = {
       id: uid(),
@@ -643,7 +706,7 @@ export const useChatStore = defineStore('chat', () => {
     return session
   }
 
-  function setNextSessionGateway(target: { profile: string; spaceId?: string | null; model?: string | null; provider?: string | null; source?: 'cli' | 'api_server' }, options: { rebindActiveDraft?: boolean } = {}) {
+  function setNextSessionGateway(target: { profile: string; spaceId?: string | null; model?: string | null; provider?: string | null; source?: SessionRunSource }, options: { rebindActiveDraft?: boolean } = {}) {
     const profile = target.profile || 'default'
     nextSessionProfile.value = profile
     nextSessionSpaceId.value = target.spaceId || null
@@ -665,7 +728,7 @@ export const useChatStore = defineStore('chat', () => {
     } else {
       localStorage.removeItem(NEXT_SESSION_PROVIDER_KEY)
     }
-    nextSessionSource.value = target.source === 'api_server' ? 'api_server' : 'cli'
+    nextSessionSource.value = normalizeSessionSource(target.source)
     localStorage.setItem(NEXT_SESSION_SOURCE_KEY, nextSessionSource.value)
 
     const shouldRebindActiveDraft = options.rebindActiveDraft ?? true
@@ -753,7 +816,7 @@ export const useChatStore = defineStore('chat', () => {
     return true
   }
 
-  async function switchToGatewayTargetSession(target: { profile: string; spaceId?: string | null; model?: string | null; provider?: string | null; source?: 'cli' | 'api_server' }): Promise<boolean> {
+  async function switchToGatewayTargetSession(target: { profile: string; spaceId?: string | null; model?: string | null; provider?: string | null; source?: SessionRunSource }): Promise<boolean> {
     const profile = target.profile || 'default'
     setNextSessionGateway(target, { rebindActiveDraft: false })
     const switched = await switchToMostRecentSessionForGateway(profile, target.spaceId || null, {
@@ -775,7 +838,7 @@ export const useChatStore = defineStore('chat', () => {
       spaceId: target.spaceId || null,
       model: target.model || undefined,
       provider: target.provider || undefined,
-      source: target.source || 'cli',
+      source: normalizeSessionSource(target.source),
     })
     await switchSession(draft.id)
     return true
@@ -791,7 +854,9 @@ export const useChatStore = defineStore('chat', () => {
   ) {
     const session = sessions.value.find(s => s.id === sessionId) || null
     const profile = target?.profile || session?.profile || 'default'
-    const source = target?.source === 'api_server' || session?.source === 'api_server' ? 'api_server' : 'cli'
+    const source = session?.source
+      ? normalizeSessionSource(session.source)
+      : normalizeSessionSource(target?.source)
     setNextSessionGateway({
       profile,
       spaceId: target?.spaceId ?? session?.spaceId ?? null,
@@ -815,6 +880,7 @@ export const useChatStore = defineStore('chat', () => {
     focusMessageId.value = focusId ?? null
     const targetSession = sessions.value.find(s => s.id === sessionId) || null
     activeSession.value = targetSession
+    activateCachedFollowupsForSession(sessionId, targetSession)
 
     if (!targetSession) return
 
@@ -964,7 +1030,7 @@ export const useChatStore = defineStore('chat', () => {
     resumeServerWorkingRun(sessionId)
   }
 
-  function newChat(options: { profile?: string; spaceId?: string | null; model?: string; provider?: string; source?: 'cli' | 'api_server' } = {}) {
+  function newChat(options: SessionDraftOptions = {}) {
     const appStore = useAppStore()
     const session = createSession({
       profile: options.profile,
@@ -973,6 +1039,15 @@ export const useChatStore = defineStore('chat', () => {
       provider: options.provider || appStore.selectedProvider || '',
       source: options.source,
     })
+    if (hasExplicitDraftGateway(options)) {
+      setNextSessionGateway({
+        profile: session.profile || 'default',
+        spaceId: session.spaceId || null,
+        model: session.model || null,
+        provider: session.provider || null,
+        source: normalizeSessionSource(session.source),
+      }, { rebindActiveDraft: false })
+    }
     switchSession(session.id)
   }
 

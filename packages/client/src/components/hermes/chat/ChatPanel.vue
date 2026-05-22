@@ -19,6 +19,11 @@ import {
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { copyToClipboard } from "@/utils/clipboard";
+import {
+  getSessionRunSourceGroupKey,
+  groupSessionsByRunSource,
+  type SessionRunSourceGroupKey,
+} from "./session-source-groups";
 import { filterSessionsForProfileWithFallback } from "./session-profile-filter";
 import {
   buildGatewayTargetOptions,
@@ -40,6 +45,8 @@ const gatewayRegistry = useGatewayRegistryStore();
 const sessionBrowserPrefsStore = useSessionBrowserPrefsStore();
 const message = useMessage();
 const { t } = useI18n();
+
+const SESSION_SOURCE_GROUPS_COLLAPSED_KEY = "hermes_chat_session_source_groups_collapsed";
 
 const showDrawer = ref(false);
 const drawerActiveTab = ref<"terminal" | "files">("files");
@@ -93,7 +100,7 @@ function handleSessionClick(sessionId: string) {
       spaceId: target.spaceId,
       model: session?.model || target.defaultModel || target.model || null,
       provider: session?.provider || target.provider || null,
-      source: target.source,
+      source: session?.source === "api_server" || session?.source === "cli" ? session.source : target.source,
     }
     : undefined);
   if (mobileQuery?.matches) showSessions.value = false;
@@ -167,6 +174,69 @@ const unpinnedSessions = computed(() =>
       (session) => !sessionBrowserPrefsStore.isPinned(session.id),
     ),
   ),
+);
+
+interface SessionSourceGroup {
+  key: SessionRunSourceGroupKey;
+  label: string;
+  sessions: Session[];
+}
+
+function loadCollapsedSessionSourceGroups() {
+  try {
+    return new Set<string>(
+      JSON.parse(localStorage.getItem(SESSION_SOURCE_GROUPS_COLLAPSED_KEY) || "[]"),
+    );
+  } catch {
+    return new Set<string>();
+  }
+}
+
+const collapsedSessionSourceGroups = ref<Set<string>>(loadCollapsedSessionSourceGroups());
+
+function persistCollapsedSessionSourceGroups() {
+  localStorage.setItem(
+    SESSION_SOURCE_GROUPS_COLLAPSED_KEY,
+    JSON.stringify([...collapsedSessionSourceGroups.value]),
+  );
+}
+
+function isSessionSourceGroupCollapsed(key: string) {
+  return collapsedSessionSourceGroups.value.has(key);
+}
+
+function toggleSessionSourceGroup(key: string) {
+  const next = new Set(collapsedSessionSourceGroups.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  collapsedSessionSourceGroups.value = next;
+  persistCollapsedSessionSourceGroups();
+}
+
+const sessionSourceGroupLabels = computed<Record<SessionRunSourceGroupKey, string>>(() => ({
+  cli: t("chat.sessionModeBridge"),
+  api_server: t("chat.sessionModeApiServer"),
+  other: t("chat.other"),
+}));
+
+const unpinnedSessionGroups = computed<SessionSourceGroup[]>(() =>
+  groupSessionsByRunSource(unpinnedSessions.value).map((group) => ({
+    ...group,
+    label: sessionSourceGroupLabels.value[group.key],
+  })),
+);
+
+watch(
+  () => chatStore.activeSession?.source,
+  (source) => {
+    const activeGroup = getSessionRunSourceGroupKey(source);
+    if (!collapsedSessionSourceGroups.value.has(activeGroup)) return;
+    collapsedSessionSourceGroups.value = new Set(
+      [...collapsedSessionSourceGroups.value].filter((key) => key !== activeGroup),
+    );
+    persistCollapsedSessionSourceGroups();
+  },
+  { immediate: true },
 );
 
 watch(
@@ -328,8 +398,14 @@ const activeModelLabel = computed(
   () => chatStore.activeSession?.model || appStore.selectedModel || "default",
 );
 
-const activeSessionSource = computed(() =>
-  currentMode.value === "chat" ? chatStore.activeSession?.source || "" : "",
+function sessionSourceLabel(source?: string | null) {
+  if (source === "api_server") return t("chat.sessionModeApiServer");
+  if (source === "cli") return t("chat.sessionModeBridge");
+  return source || "";
+}
+
+const activeSessionSourceLabel = computed(() =>
+  currentMode.value === "chat" ? sessionSourceLabel(chatStore.activeSession?.source) : "",
 );
 
 const activeApproval = computed(() => chatStore.activePendingApproval);
@@ -337,9 +413,20 @@ const visibleApproval = computed(() => activeApproval.value);
 const showNewChatModal = ref(false);
 const newChatProfile = ref<string>("default");
 const newChatTarget = ref<string>("");
+const newChatSource = ref<"cli" | "api_server">("cli");
 const newChatProvider = ref<string>("");
 const newChatModel = ref<string>("");
 const newChatLoading = ref(false);
+const newChatSourceOptions = computed(() => [
+  {
+    label: t("chat.sessionModeBridge"),
+    value: "cli" as const,
+  },
+  {
+    label: t("chat.sessionModeApiServer"),
+    value: "api_server" as const,
+  },
+]);
 
 function getModelGroupsForProfile(profile: string) {
   const profileModels = appStore.profileModelGroups.find(
@@ -435,6 +522,7 @@ async function openNewChatModal() {
     }
     newChatTarget.value = selectedGatewayTarget.value;
     newChatProfile.value = newChatTargetOption.value?.profile || "default";
+    newChatSource.value = chatStore.nextSessionSource || newChatTargetOption.value?.source || "cli";
     syncNewChatModelSelection();
   } finally {
     newChatLoading.value = false;
@@ -443,7 +531,12 @@ async function openNewChatModal() {
 
 function handleNewChatTargetChange(value: string) {
   newChatTarget.value = value;
+  newChatSource.value = newChatTargetOption.value?.source || "cli";
   syncNewChatModelSelection();
+}
+
+function handleNewChatSourceChange(source: "cli" | "api_server") {
+  newChatSource.value = source;
 }
 
 function handleNewChatProviderChange(value: string) {
@@ -458,7 +551,7 @@ function confirmNewChat() {
     spaceId: target?.spaceId || null,
     provider: newChatProvider.value,
     model: newChatModel.value,
-    source: target?.source,
+    source: newChatSource.value,
   });
   showNewChatModal.value = false;
 }
@@ -1036,25 +1129,52 @@ async function handleSessionModelCustomSubmit() {
           />
         </template>
 
-        <SessionListItem
-          v-for="s in unpinnedSessions"
-          :key="s.id"
-          :session="s"
-          :active="s.id === chatStore.activeSessionId"
-          :pinned="false"
-          :can-delete="
-            s.id !== chatStore.activeSessionId ||
-            chatStore.sessions.length > 1
-          "
-          :streaming="chatStore.isSessionLive(s.id)"
-          :selectable="isBatchMode"
-          :selected="isSessionSelected(s.id)"
-          :show-profile="true"
-          @select="handleSessionClick(s.id)"
-          @contextmenu="handleContextMenu($event, s.id)"
-          @delete="handleDeleteSession(s.id)"
-          @toggle-select="toggleSessionSelection(s.id)"
-        />
+        <template v-for="group in unpinnedSessionGroups" :key="group.key">
+          <button
+            type="button"
+            class="session-group-header session-group-header--button"
+            :aria-expanded="!isSessionSourceGroupCollapsed(group.key)"
+            @click="toggleSessionSourceGroup(group.key)"
+          >
+            <svg
+              class="group-chevron"
+              :class="{ collapsed: isSessionSourceGroupCollapsed(group.key) }"
+              width="10"
+              height="10"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+            <span class="session-group-label">{{ group.label }}</span>
+            <span class="session-group-count">{{ group.sessions.length }}</span>
+          </button>
+          <template v-if="!isSessionSourceGroupCollapsed(group.key)">
+            <SessionListItem
+              v-for="s in group.sessions"
+              :key="s.id"
+              :session="s"
+              :active="s.id === chatStore.activeSessionId"
+              :pinned="false"
+              :can-delete="
+                s.id !== chatStore.activeSessionId ||
+                chatStore.sessions.length > 1
+              "
+              :streaming="chatStore.isSessionLive(s.id)"
+              :selectable="isBatchMode"
+              :selected="isSessionSelected(s.id)"
+              :show-profile="true"
+              @select="handleSessionClick(s.id)"
+              @contextmenu="handleContextMenu($event, s.id)"
+              @delete="handleDeleteSession(s.id)"
+              @toggle-select="toggleSessionSelection(s.id)"
+            />
+          </template>
+        </template>
       </div>
     </aside>
 
@@ -1204,6 +1324,21 @@ async function handleSessionModelCustomSubmit() {
     >
       <div class="new-chat-form">
         <label class="new-chat-field">
+          <span class="new-chat-label">{{ t("chat.sessionMode") }}</span>
+          <div class="new-chat-mode-toggle" role="group" :aria-label="t('chat.sessionMode')">
+            <button
+              v-for="option in newChatSourceOptions"
+              :key="option.value"
+              type="button"
+              class="new-chat-mode-button"
+              :class="{ active: newChatSource === option.value }"
+              @click="handleNewChatSourceChange(option.value)"
+            >
+              {{ option.label }}
+            </button>
+          </div>
+        </label>
+        <label class="new-chat-field">
           <span class="new-chat-label">{{ t("chat.gatewayTarget") }}</span>
           <NSelect
             :value="newChatTarget"
@@ -1335,7 +1470,7 @@ async function handleSessionModelCustomSubmit() {
             </template>
           </NButton>
           <span class="header-session-title">{{ headerTitle }}</span>
-          <span v-if="activeSessionSource" class="source-badge">{{ activeSessionSource }}</span>
+          <span v-if="activeSessionSourceLabel" class="source-badge">{{ activeSessionSourceLabel }}</span>
           <span v-if="activeSpace" class="session-meta-badge">Space: {{ activeSpace.displayName }}</span>
           <span v-if="chatStore.activeSession" class="session-meta-badge">Gateway: {{ activeGateway?.displayName || chatStore.activeSession.profile || "default" }}</span>
           <span v-if="chatStore.activeSession" class="session-meta-badge">Model: {{ activeModelLabel }}</span>
@@ -2033,6 +2168,39 @@ async function handleSessionModelCustomSubmit() {
   font-weight: 500;
 }
 
+.new-chat-mode-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid $border-color;
+  border-radius: 8px;
+  background: $bg-card;
+}
+
+.new-chat-mode-button {
+  height: 34px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: $text-secondary;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all $transition-fast;
+
+  &:hover {
+    color: $text-primary;
+    background: $bg-card-hover;
+  }
+
+  &.active {
+    color: $text-primary;
+    border-color: rgba(var(--accent-primary-rgb), 0.25);
+    background: rgba(var(--accent-primary-rgb), 0.12);
+  }
+}
+
 .new-chat-actions {
   display: flex;
   justify-content: flex-end;
@@ -2050,6 +2218,14 @@ async function handleSessionModelCustomSubmit() {
 
 .session-group-header--static {
   cursor: default;
+}
+
+.session-group-header--button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
 }
 
 .group-chevron {

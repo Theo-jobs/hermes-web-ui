@@ -47,6 +47,7 @@ const profileHasModels = computed(() => {
   if (profileModels?.groups?.some(group => group.models.length > 0)) return true
   const gateway = gatewayRegistry.gateways.find(item => item.profile === profileName.value)
   if (!gateway) return false
+  if (props.session.provider && props.session.model) return true
   return getModelGroupsForGatewayTarget({
     profile: profileName.value,
     defaultModel: gateway.defaultModel,

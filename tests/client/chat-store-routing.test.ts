@@ -390,6 +390,101 @@ describe('chat store routing', () => {
     })
   })
 
+  it('allows the new-chat UI to override a remote target back to bridge mode', () => {
+    const store = useChatStore()
+
+    store.newChat({
+      profile: 'hefeng',
+      spaceId: 'hefeng-work',
+      model: 'gpt-5.5',
+      provider: 'custom:hefeng',
+      source: 'cli',
+    })
+
+    expect(store.nextSessionProfile).toBe('hefeng')
+    expect(store.nextSessionSpaceId).toBe('hefeng-work')
+    expect(store.nextSessionSource).toBe('cli')
+    expect(store.activeSession).toMatchObject({
+      profile: 'hefeng',
+      spaceId: 'hefeng-work',
+      model: 'gpt-5.5',
+      provider: 'custom:hefeng',
+      source: 'cli',
+    })
+  })
+
+  it('keeps a bridge session in bridge mode when it is clicked from a remote gateway list', async () => {
+    const store = useChatStore()
+
+    store.newChat({
+      profile: 'hefeng',
+      spaceId: 'hefeng-work',
+      model: 'gpt-5.5',
+      provider: 'custom:hefeng',
+      source: 'cli',
+    })
+    const bridgeSessionId = store.activeSessionId!
+
+    await store.switchToSessionWithGatewayContext(bridgeSessionId, {
+      profile: 'hefeng',
+      spaceId: 'hefeng-work',
+      model: 'gpt-5.5',
+      provider: 'custom:hefeng',
+      source: 'api_server',
+    })
+    await store.sendMessage('Bridge should stay bridge')
+
+    expect(store.activeSession?.source).toBe('cli')
+    expect(store.nextSessionSource).toBe('cli')
+    expect(mockedStartRunViaSocket.mock.calls[0][0]).toMatchObject({
+      input: 'Bridge should stay bridge',
+      profile: 'hefeng',
+      source: 'cli',
+      model: 'gpt-5.5',
+      provider: 'custom:hefeng',
+    })
+  })
+
+  it('does not let a pending session refresh replace a newly created bridge draft', async () => {
+    let resolveFetch: (value: any[]) => void = () => {}
+    mockedFetchSessions.mockReturnValue(new Promise(resolve => {
+      resolveFetch = resolve
+    }) as any)
+
+    const store = useChatStore()
+    const loadPromise = store.loadSessions()
+
+    store.newChat({
+      profile: 'hefeng',
+      spaceId: 'hefeng-work',
+      model: 'gpt-5.5',
+      provider: 'custom:hefeng',
+      source: 'cli',
+    })
+    const draftId = store.activeSessionId
+
+    resolveFetch([
+      {
+        ...sessionSummary('hefeng-old-api', 'hefeng', 500),
+        space_id: 'hefeng-work',
+        source: 'api_server',
+        provider: 'custom:hefeng',
+        model: 'gpt-5.5',
+        title: 'Older API session',
+      },
+    ] as any)
+    await loadPromise
+
+    expect(store.activeSessionId).toBe(draftId)
+    expect(store.activeSession).toMatchObject({
+      id: draftId,
+      profile: 'hefeng',
+      spaceId: 'hefeng-work',
+      source: 'cli',
+    })
+    expect(store.sessions.some(session => session.id === draftId)).toBe(true)
+  })
+
   it('syncs gateway context when a user clicks a remote history session', async () => {
     mockedFetchSessions.mockResolvedValue([
       { ...sessionSummary('default-old', 'default', 500), space_id: 'daily-mac' },

@@ -34,6 +34,7 @@ const ensureOpenBridgeAssistantMessageMock = vi.fn()
 const syncBridgeReasoningToMessageMock = vi.fn()
 const recordBridgeToolStartedMock = vi.fn()
 const recordBridgeToolCompletedMock = vi.fn()
+const recordBridgeRunErrorMock = vi.fn((_state: any, _sessionId: string, error: string) => error)
 const resolveBridgeRunModelConfigMock = vi.fn()
 
 vi.mock('../../packages/server/src/lib/llm-prompt', () => ({
@@ -81,6 +82,7 @@ vi.mock('../../packages/server/src/services/hermes/run-chat/bridge-message', () 
   syncBridgeReasoningToMessage: syncBridgeReasoningToMessageMock,
   recordBridgeToolStarted: recordBridgeToolStartedMock,
   recordBridgeToolCompleted: recordBridgeToolCompletedMock,
+  recordBridgeRunError: recordBridgeRunErrorMock,
 }))
 
 vi.mock('../../packages/server/src/services/hermes/run-chat/model-config', () => ({

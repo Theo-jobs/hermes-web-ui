@@ -793,6 +793,18 @@ class AgentPool:
         session = self._sessions.pop(session_id, None)
         if session is None:
             return
+        try:
+            shutdown_memory = getattr(session.agent, "shutdown_memory_provider", None)
+            if callable(shutdown_memory):
+                messages = session.history if isinstance(session.history, list) else []
+                shutdown_memory(messages)
+        except Exception as exc:
+            print(
+                "[hermes_bridge] memory provider shutdown failed "
+                f"session={session_id}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
         with self._lock:
             for rid in list(self._runs):
                 if self._runs[rid].session_id == session_id:
@@ -1332,7 +1344,7 @@ class AgentPool:
 
     def destroy(self, session_id: str) -> dict[str, Any]:
         with self._lock:
-            session = self._sessions.pop(session_id, None)
+            session = self._sessions.get(session_id)
         if session is None:
             return {"session_id": session_id, "destroyed": False}
         if session.running and hasattr(session.agent, "interrupt"):
@@ -1340,6 +1352,7 @@ class AgentPool:
                 session.agent.interrupt("Session destroyed")
             except Exception:
                 pass
+        self._destroy_session(session_id)
         return {"session_id": session_id, "destroyed": True}
 
     def destroy_all(self) -> dict[str, Any]:

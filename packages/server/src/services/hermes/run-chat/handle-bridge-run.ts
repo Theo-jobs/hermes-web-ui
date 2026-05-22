@@ -25,6 +25,7 @@ import {
   syncBridgeReasoningToMessage,
   recordBridgeToolStarted,
   recordBridgeToolCompleted,
+  recordBridgeRunError,
 } from './bridge-message'
 import { summarizeToolArguments } from './response-utils'
 import type { ContentBlock, SessionState } from './types'
@@ -300,9 +301,10 @@ export async function handleBridgeRun(
     state.activeRunMarker = undefined
     state.events = []
     state.bridgePendingToolCallMarkup = undefined
-    flushBridgePendingToDb(state, session_id)
-    updateSessionStats(session_id)
     const message = err instanceof Error ? err.message : String(err)
+    flushBridgePendingToDb(state, session_id, runMarker)
+    const safeMessage = recordBridgeRunError(state, session_id, message, runMarker)
+    updateSessionStats(session_id)
     const errUsage = await calcAndUpdateUsage(session_id, state, emit)
     const errContextTokens = await refreshFinalContextUsage({
       sessionId: session_id,
@@ -322,7 +324,7 @@ export async function handleBridgeRun(
     })
     emit('run.failed', {
       event: 'run.failed',
-      error: message,
+      error: safeMessage,
       inputTokens: errUsage.inputTokens,
       outputTokens: errUsage.outputTokens,
       contextTokens: errContextTokens,
@@ -666,7 +668,11 @@ async function applyBridgeChunkAsync(
     return
   }
 
-  flushBridgePendingToDb(state, sessionId)
+  flushBridgePendingToDb(state, sessionId, runMarker)
+  const terminalError = bridgeTerminalError(chunk)
+  const bridgeError = terminalError
+    ? recordBridgeRunError(state, sessionId, terminalError, runMarker)
+    : undefined
   state.bridgePendingToolCallMarkup = undefined
   updateSessionStats(sessionId)
   await delay(BRIDGE_USAGE_FLUSH_DELAY_MS)
@@ -699,14 +705,13 @@ async function applyBridgeChunkAsync(
   state.runId = undefined
   state.activeRunMarker = undefined
   state.events = []
-  const terminalError = bridgeTerminalError(chunk)
   const eventName = terminalError ? 'run.failed' : 'run.completed'
   const payload = {
     event: eventName,
     run_id: chunk.run_id,
     output: chunk.output || state.bridgeOutput || '',
     result: chunk.result,
-    error: terminalError || chunk.error,
+    error: bridgeError || terminalError || chunk.error,
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
     contextTokens,
