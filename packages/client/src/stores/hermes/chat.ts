@@ -73,6 +73,7 @@ export interface Session {
   messageCount?: number
   inputTokens?: number
   outputTokens?: number
+  contextTokens?: number
   endedAt?: number | null
   lastActiveAt?: number
   workspace?: string | null
@@ -112,6 +113,21 @@ async function uploadFiles(attachments: Attachment[]): Promise<{ name: string; p
   if (!res.ok) throw new Error(`Upload failed: ${res.status}`)
   const data = await res.json() as { files: { name: string; path: string; type?: string; size?: number }[] }
   return data.files
+}
+
+function isToolOutputError(output: unknown): boolean {
+  if (typeof output !== 'string' || !output.trim()) return false
+  try {
+    const parsed = JSON.parse(output)
+    if (parsed && typeof parsed === 'object') {
+      const record = parsed as Record<string, unknown>
+      if (record.success === false) return true
+      if (record.error != null && String(record.error).trim() !== '') return true
+    }
+  } catch {
+    return false
+  }
+  return false
 }
 
 async function buildContentBlocks(
@@ -414,6 +430,7 @@ export const useChatStore = defineStore('chat', () => {
   const streamStates = ref<Map<string, { abort: () => void }>>(new Map())
   /** sessionId → server-reported isWorking status */
   const serverWorking = ref<Set<string>>(new Set())
+  const sessionProfileFilter = ref<string | null>(null)
   /** sessionId → queued message count */
   const queueLengths = ref<Map<string, number>>(new Map())
   /** sessionId → queued user messages not yet visible in the transcript */
@@ -835,6 +852,7 @@ export const useChatStore = defineStore('chat', () => {
           }
           if (data.inputTokens != null) targetSession.inputTokens = data.inputTokens
           if (data.outputTokens != null) targetSession.outputTokens = data.outputTokens
+          if ((data as any).contextTokens != null) targetSession.contextTokens = (data as any).contextTokens
           if (data.messages?.length) {
             targetSession.messages = mapHermesMessages(data.messages as any[])
             if (!data.isWorking) {
@@ -866,14 +884,16 @@ export const useChatStore = defineStore('chat', () => {
                   compressed: null,
                 })
               } else if (e.event === 'compression.completed') {
+                const afterTokens = e.contextTokens || e.afterTokens || 0
                 setCompressionStateForSession(sessionId, {
                   compressing: false,
                   messageCount: e.totalMessages || 0,
                   beforeTokens: e.beforeTokens || 0,
-                  afterTokens: e.afterTokens || 0,
+                  afterTokens,
                   compressed: e.compressed ?? false,
                   error: e.error,
                 })
+                if (e.contextTokens != null) targetSession.contextTokens = e.contextTokens
               } else if (e.event === 'abort.started') {
                 setAbortState({ aborting: true, synced: null })
               } else if (e.event === 'abort.completed') {
@@ -882,6 +902,50 @@ export const useChatStore = defineStore('chat', () => {
                 setPendingApproval({ ...e, session_id: sessionId } as RunEvent)
               } else if (e.event === 'approval.resolved') {
                 clearPendingApproval({ ...e, session_id: sessionId } as RunEvent)
+              } else if (e.event === 'run.failed') {
+                addAgentErrorMessage(sessionId, e.error)
+                serverWorking.value.delete(sessionId)
+                queueLengths.value.delete(sessionId)
+              } else if (e.event === 'tool.started') {
+                const msgs = getSessionMsgs(sessionId)
+                const toolCallId = e.tool_call_id as string | undefined
+                const existingTool = toolCallId
+                  ? msgs.find(m => m.role === 'tool' && m.toolCallId === toolCallId)
+                  : null
+                if (existingTool) {
+                  updateMessage(sessionId, existingTool.id, {
+                    toolName: e.tool || e.name,
+                    toolArgs: typeof e.arguments === 'string' ? e.arguments : existingTool.toolArgs,
+                    toolPreview: e.preview || existingTool.toolPreview,
+                    toolStatus: existingTool.toolStatus || 'running',
+                  })
+                } else {
+                  addMessage(sessionId, {
+                    id: uid(),
+                    role: 'tool',
+                    content: '',
+                    timestamp: Date.now(),
+                    toolName: e.tool || e.name,
+                    toolCallId,
+                    toolPreview: e.preview,
+                    toolArgs: typeof e.arguments === 'string' ? e.arguments : undefined,
+                    toolStatus: 'running',
+                  })
+                }
+              } else if (e.event === 'tool.completed') {
+                const msgs = getSessionMsgs(sessionId)
+                const toolCallId = e.tool_call_id as string | undefined
+                const toolMsgs = toolCallId
+                  ? msgs.filter(m => m.role === 'tool' && m.toolCallId === toolCallId)
+                  : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
+                if (toolMsgs.length > 0) {
+                  const output = typeof e.output === 'string' ? e.output : undefined
+                  updateMessage(sessionId, toolMsgs[toolMsgs.length - 1].id, {
+                    toolStatus: e.error === true || isToolOutputError(output) ? 'error' : 'done',
+                    toolDuration: e.duration,
+                    toolResult: output,
+                  })
+                }
               }
             }
           }
@@ -1052,6 +1116,29 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function addAgentErrorMessage(sessionId: string, error?: string | null) {
+    const content = error ? `Error: ${error}` : 'Run failed'
+    const msgs = getSessionMsgs(sessionId)
+    const last = msgs[msgs.length - 1]
+    if (last?.isStreaming) {
+      updateMessage(sessionId, last.id, {
+        role: 'assistant',
+        content,
+        isStreaming: false,
+        systemType: 'error',
+      })
+      return
+    }
+    if (last?.role === 'assistant' && last.systemType === 'error' && last.content === content) return
+    addMessage(sessionId, {
+      id: uid(),
+      role: 'assistant',
+      content,
+      timestamp: Date.now(),
+      systemType: 'error',
+    })
+  }
+
   function handleSessionCommandEvent(evt: RunEvent) {
     const sid = evt.session_id
     if (!sid) return
@@ -1087,6 +1174,7 @@ export const useChatStore = defineStore('chat', () => {
     if (action === 'usage' && target) {
       target.inputTokens = (evt as any).inputTokens
       target.outputTokens = (evt as any).outputTokens
+      if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
     }
 
     if (action === 'destroy') {
@@ -1409,14 +1497,19 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'compression.completed': {
+              const afterTokens = (evt as any).contextTokens || (evt as any).afterTokens || 0
               setCompressionStateForSession(sid, {
                 compressing: false,
                 messageCount: (evt as any).totalMessages || 0,
                 beforeTokens: (evt as any).beforeTokens || 0,
-                afterTokens: (evt as any).afterTokens || 0,
+                afterTokens,
                 compressed: (evt as any).compressed ?? false,
                 error: (evt as any).error,
               })
+              if ((evt as any).contextTokens != null) {
+                const target = sessions.value.find(s => s.id === sid)
+                if (target) target.contextTokens = (evt as any).contextTokens
+              }
               // Auto-clear after 5s
               setTimeout(() => {
                 const state = compressionStates.value.get(sid)
@@ -1577,13 +1670,13 @@ export const useChatStore = defineStore('chat', () => {
                 : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
               if (toolMsgs.length > 0) {
                 const last = toolMsgs[toolMsgs.length - 1]
-                // Check if tool errored
-                const hasError = (evt as any).error === true
+                const output = typeof (evt as any).output === 'string' ? (evt as any).output : undefined
+                const hasError = (evt as any).error === true || isToolOutputError(output)
                 const duration = (evt as any).duration
                 updateMessage(sid, last.id, {
                   toolStatus: hasError ? 'error' : 'done',
                   toolDuration: duration,
-                  toolResult: typeof (evt as any).output === 'string' ? (evt as any).output : undefined,
+                  toolResult: output,
                 })
               }
 
@@ -1614,6 +1707,7 @@ export const useChatStore = defineStore('chat', () => {
                 if (target) {
                   target.inputTokens = (evt as any).inputTokens
                   target.outputTokens = (evt as any).outputTokens
+                  if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
                 }
               }
               // Belt-and-suspenders: some providers may deliver the final
@@ -1706,22 +1800,16 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'run.failed': {
-              const msgs = getSessionMsgs(sid)
-              const lastErr = msgs[msgs.length - 1]
-              if (lastErr?.isStreaming) {
-                updateMessage(sid, lastErr.id, {
-                  isStreaming: false,
-                  content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-                  role: 'system',
-                })
-              } else {
-                addMessage(sid, {
-                  id: uid(),
-                  role: 'system',
-                  content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-                  timestamp: Date.now(),
-                })
+              if ((evt as any).inputTokens != null) {
+                const target = sessions.value.find(s => s.id === sid)
+                if (target) {
+                  target.inputTokens = (evt as any).inputTokens
+                  target.outputTokens = (evt as any).outputTokens
+                  if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
+                }
               }
+              addAgentErrorMessage(sid, evt.error)
+              const msgs = getSessionMsgs(sid)
               msgs.forEach((m, i) => {
                 if (m.role === 'tool' && m.toolStatus === 'running') {
                   msgs[i] = { ...m, toolStatus: 'error' }
@@ -1740,6 +1828,7 @@ export const useChatStore = defineStore('chat', () => {
               if (target) {
                 target.inputTokens = (evt as any).inputTokens
                 target.outputTokens = (evt as any).outputTokens
+                if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
               }
               break
             }
@@ -1758,20 +1847,14 @@ export const useChatStore = defineStore('chat', () => {
         // onError
         (err) => {
           console.warn('Socket.IO run stream error:', err.message)
+          addAgentErrorMessage(sid, err.message)
           const msgs = getSessionMsgs(sid)
-          const last = msgs[msgs.length - 1]
-          if (last?.isStreaming) {
-            updateMessage(sid, last.id, { isStreaming: false })
-          }
           msgs.forEach((m, i) => {
             if (m.role === 'tool' && m.toolStatus === 'running') {
-              msgs[i] = { ...m, toolStatus: 'done' }
+              msgs[i] = { ...m, toolStatus: 'error' }
             }
           })
           cleanup()
-          if (sid === activeSessionId.value) {
-            void refreshActiveSession()
-          }
         },
         undefined,
       )
@@ -1868,14 +1951,19 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         case 'compression.completed': {
+          const afterTokens = (evt as any).contextTokens || (evt as any).afterTokens || 0
           setCompressionStateForSession(sid, {
             compressing: false,
             messageCount: (evt as any).totalMessages || 0,
             beforeTokens: (evt as any).beforeTokens || 0,
-            afterTokens: (evt as any).afterTokens || 0,
+            afterTokens,
             compressed: (evt as any).compressed ?? false,
             error: (evt as any).error,
           })
+          if ((evt as any).contextTokens != null) {
+            const target = sessions.value.find(s => s.id === sid)
+            if (target) target.contextTokens = (evt as any).contextTokens
+          }
           setTimeout(() => {
             const state = compressionStates.value.get(sid)
             if (state && !state.compressing) {
@@ -2026,11 +2114,12 @@ export const useChatStore = defineStore('chat', () => {
             ? msgs.filter(m => m.role === 'tool' && m.toolCallId === toolCallId)
             : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
           if (toolMsgs.length > 0) {
-            const hasError = (evt as any).error === true
+            const output = typeof (evt as any).output === 'string' ? (evt as any).output : undefined
+            const hasError = (evt as any).error === true || isToolOutputError(output)
             updateMessage(sid, toolMsgs[toolMsgs.length - 1].id, {
               toolStatus: hasError ? 'error' : 'done',
               toolDuration: (evt as any).duration,
-              toolResult: typeof (evt as any).output === 'string' ? (evt as any).output : undefined,
+              toolResult: output,
             })
           }
 
@@ -2067,6 +2156,7 @@ export const useChatStore = defineStore('chat', () => {
             if (target) {
               target.inputTokens = (evt as any).inputTokens
               target.outputTokens = (evt as any).outputTokens
+              if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
             }
           }
           // Check if backend provided parsed content (from stringified array format)
@@ -2139,28 +2229,22 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         case 'run.failed': {
+          if ((evt as any).inputTokens != null) {
+            const target = sessions.value.find(s => s.id === sid)
+            if (target) {
+              target.inputTokens = (evt as any).inputTokens
+              target.outputTokens = (evt as any).outputTokens
+              if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
+            }
+          }
           const hasQueue = (evt as any).queue_remaining > 0
           if (hasQueue) {
             queueLengths.value.set(sid, (evt as any).queue_remaining)
           } else {
             queueLengths.value.delete(sid)
           }
+          addAgentErrorMessage(sid, evt.error)
           const msgs = getSessionMsgs(sid)
-          const lastErr = msgs[msgs.length - 1]
-          if (lastErr?.isStreaming) {
-            updateMessage(sid, lastErr.id, {
-              isStreaming: false,
-              content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-              role: 'system',
-            })
-          } else {
-            addMessage(sid, {
-              id: uid(),
-              role: 'system',
-              content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-              timestamp: Date.now(),
-            })
-          }
           msgs.forEach((m, i) => {
             if (m.role === 'tool' && m.toolStatus === 'running') {
               msgs[i] = { ...m, toolStatus: 'error' }
@@ -2177,6 +2261,7 @@ export const useChatStore = defineStore('chat', () => {
           if (target) {
             target.inputTokens = (evt as any).inputTokens
             target.outputTokens = (evt as any).outputTokens
+            if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
           }
           break
         }
@@ -2351,6 +2436,7 @@ export const useChatStore = defineStore('chat', () => {
     isStreaming,
     isRunActive,
     isSessionLive,
+    sessionProfileFilter,
     compressionState,
     abortState,
     isAborting,

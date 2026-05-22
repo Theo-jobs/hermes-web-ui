@@ -560,7 +560,7 @@ function openChangelog() {
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
   overflow: hidden;
 }
 
@@ -568,7 +568,7 @@ function openChangelog() {
   display: flex;
   align-items: center;
   flex-shrink: 0;
-  gap: 8px;
+  gap: 6px;
 }
 
 :deep(.theme-switch-container) {
@@ -593,10 +593,8 @@ function openChangelog() {
 }
 
 .version-text {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex: 0 0 auto;
+  overflow: visible;
   white-space: nowrap;
   cursor: pointer;
   transition: color 0.2s;

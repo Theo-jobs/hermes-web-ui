@@ -220,20 +220,25 @@ export async function listHermesSessions(ctx: any) {
 }
 
 export async function search(ctx: any) {
-  if (useLocalSessionStore()) {
-    const q = typeof ctx.query.q === 'string' ? ctx.query.q : ''
-    const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
-    const profile = getActiveProfileName()
-    const results = localSearchSessions(profile, q, limit && limit > 0 ? limit : 20)
-    ctx.body = { results: filterPendingDeletedSessions(results) }
-    return
-  }
-
   const q = typeof ctx.query.q === 'string' ? ctx.query.q : ''
   const source = typeof ctx.query.source === 'string' && ctx.query.source.trim()
     ? ctx.query.source.trim()
     : undefined
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
+  const profile = typeof ctx.query.profile === 'string' && ctx.query.profile.trim()
+    ? ctx.query.profile.trim()
+    : undefined
+
+  if (useLocalSessionStore()) {
+    const results = localSearchSessions(profile, q, limit && limit > 0 ? limit : 20)
+    const knownProfiles = profile ? null : listKnownSessionProfiles()
+    ctx.body = {
+      results: enrichGatewaySessionMetadata(filterPendingDeletedSessions(results.filter(s =>
+        !knownProfiles || knownProfiles.has(s.profile || 'default'),
+      ))),
+    }
+    return
+  }
 
   try {
     const results = await searchSessionSummaries(q, source, limit && limit > 0 ? limit : 20)

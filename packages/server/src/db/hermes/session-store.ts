@@ -5,6 +5,7 @@
 import { isSqliteAvailable, getDb } from '../index'
 import { SESSIONS_TABLE, MESSAGES_TABLE } from './schemas'
 import { config } from '../../config'
+import { normalizeMessageContentForStorageRole } from './message-content'
 
 // Re-export types for compatibility with sessions-db.ts consumers
 export interface HermesSessionRow {
@@ -304,11 +305,12 @@ export function listAllSessions(source?: string, limit = 2000): HermesSessionRow
   return rows.map(mapSessionRow)
 }
 
-export function searchSessions(profile: string, query: string, limit = 20): HermesSessionSearchRow[] {
+export function searchSessions(profile: string | null | undefined, query: string, limit = 20): HermesSessionSearchRow[] {
   if (!isSqliteAvailable()) return []
+  const profileFilter = profile?.trim()
   const trimmed = query.trim()
   if (!trimmed) {
-    return listSessions(profile, undefined, limit).map(s => ({ ...s, snippet: s.preview || '', matched_message_id: null }))
+    return listSessions(profileFilter, undefined, limit).map(s => ({ ...s, snippet: s.preview || '', matched_message_id: null }))
   }
   const db = getDb()!
   const lowered = trimmed.toLowerCase()
@@ -317,12 +319,21 @@ export function searchSessions(profile: string, query: string, limit = 20): Herm
   // Step 1: Find matching sessions
   const sessionRows = db.prepare(
     `SELECT * FROM ${SESSIONS_TABLE}
-     WHERE profile = ? AND (
+     WHERE 1 = 1
+       ${profileFilter ? 'AND profile = ?' : ''}
+       AND (
        LOWER(title) LIKE ? OR LOWER(preview) LIKE ?
        OR id IN (SELECT DISTINCT session_id FROM ${MESSAGES_TABLE} WHERE LOWER(content) LIKE ? OR LOWER(COALESCE(tool_name, '')) LIKE ?)
      )
      ORDER BY last_active DESC LIMIT ?`,
-  ).all(profile, pattern, pattern, pattern, pattern, limit) as Record<string, unknown>[]
+  ).all(...[
+    ...(profileFilter ? [profileFilter] : []),
+    pattern,
+    pattern,
+    pattern,
+    pattern,
+    limit,
+  ]) as Record<string, unknown>[]
 
   if (sessionRows.length === 0) return []
 
@@ -411,7 +422,7 @@ export function addMessage(msg: {
     `INSERT INTO ${MESSAGES_TABLE} (session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_count, finish_reason, reasoning, reasoning_details, reasoning_content)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    msg.session_id, msg.role, msg.content,
+    msg.session_id, msg.role, normalizeMessageContentForStorageRole(msg.role, msg.content),
     msg.tool_call_id ?? null, toolCallsJson, msg.tool_name ?? null,
     msg.timestamp ?? Math.floor(Date.now() / 1000),
     msg.token_count ?? null, msg.finish_reason ?? null,
@@ -446,7 +457,7 @@ export function addMessages(msgs: Array<{
     for (const msg of msgs) {
       const toolCallsJson = msg.tool_calls ? JSON.stringify(msg.tool_calls) : null
       insert.run(
-        msg.session_id, msg.role, msg.content,
+        msg.session_id, msg.role, normalizeMessageContentForStorageRole(msg.role, msg.content),
         msg.tool_call_id ?? null, toolCallsJson, msg.tool_name ?? null,
         msg.timestamp ?? Math.floor(Date.now() / 1000),
         msg.token_count ?? null, msg.finish_reason ?? null,
