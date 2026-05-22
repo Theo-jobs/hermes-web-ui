@@ -68,6 +68,19 @@ function uniqueStrings(values: unknown): string[] {
   return Array.from(new Set(values.map(v => String(v || '').trim()).filter(Boolean)))
 }
 
+function customProviderModelIds(provider: { model?: unknown; models?: unknown }): string[] {
+  const models = new Set<string>()
+  const single = String(provider.model || '').trim()
+  if (single) models.add(single)
+  if (provider.models && typeof provider.models === 'object' && !Array.isArray(provider.models)) {
+    for (const model of Object.keys(provider.models as Record<string, unknown>)) {
+      const trimmed = model.trim()
+      if (trimmed) models.add(trimmed)
+    }
+  }
+  return [...models]
+}
+
 function normalizeCustomModels(input: unknown): CustomModels {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
   const out: CustomModels = {}
@@ -337,14 +350,14 @@ async function buildAvailableForProfile(
   }
 
   const customProviders = Array.isArray(config.custom_providers)
-    ? config.custom_providers as Array<{ name: string; base_url: string; model: string; api_key?: string }>
+    ? config.custom_providers as Array<{ name: string; base_url: string; model?: string; models?: Record<string, unknown>; api_key?: string }>
     : []
   const customFetches = await Promise.allSettled(
     customProviders.map(async cp => {
       if (!cp.base_url) return null
       const providerKey = providerKeyForCustom(cp.name)
       const baseUrl = cp.base_url.replace(/\/+$/, '')
-      let models = [cp.model].filter(Boolean)
+      let models = customProviderModelIds(cp)
       if (cp.api_key) {
         const fetched = await cachedProviderModels(fetchCache, baseUrl, cp.api_key)
         if (fetched.length > 0) models = [...new Set([...models, ...fetched])]
@@ -602,7 +615,7 @@ export async function getAvailable(ctx: any) {
     }
 
     const customProviders = Array.isArray(config.custom_providers)
-      ? config.custom_providers as Array<{ name: string; base_url: string; model: string; api_key?: string }>
+      ? config.custom_providers as Array<{ name: string; base_url: string; model?: string; models?: Record<string, unknown>; api_key?: string }>
       : []
 
     const customFetches = await Promise.allSettled(
@@ -610,9 +623,12 @@ export async function getAvailable(ctx: any) {
         if (!cp.base_url) return null
         const providerKey = `custom:${cp.name.trim().toLowerCase().replace(/ /g, '-')}`
         const baseUrl = cp.base_url.replace(/\/+$/, '')
-        let models = [cp.model]
+        let models = customProviderModelIds(cp)
         if (cp.api_key) {
-          try { const fetched = await fetchProviderModels(baseUrl, cp.api_key); if (fetched.length > 0) models = [...new Set([cp.model, ...fetched])] } catch { }
+          try {
+            const fetched = await fetchProviderModels(baseUrl, cp.api_key)
+            if (fetched.length > 0) models = [...new Set([...models, ...fetched])]
+          } catch { }
         }
         return { providerKey, label: cp.name, base_url: baseUrl, models, api_key: cp.api_key || '' }
       }),

@@ -151,6 +151,41 @@ describe('models controller — model visibility', () => {
       deepseek: ['gemma-4-26b-a4b-it', 'deepseek-chat'],
     })
   })
+
+  it('shows custom provider models declared as a models map when live model fetch is empty', async () => {
+    mockFetchProviderModels.mockResolvedValue([])
+    mockReadConfigYamlForProfile.mockResolvedValue({
+      model: { default: 'gpt-5.5', provider: 'custom:nas' },
+      custom_providers: [
+        {
+          name: 'nas',
+          base_url: 'http://192.168.50.200:8317/v1',
+          api_key: '${HERMES_NAS_API_KEY}',
+          models: {
+            'gpt-5.4': { context_length: 1050000 },
+            'gpt-5.5': { context_length: 256000 },
+            'gemini-3.5-flash-low': { context_length: 1000000 },
+          },
+        },
+      ],
+    })
+
+    const ctx = makeCtx()
+    await ctrl.getAvailable(ctx)
+
+    expect(ctx.status).toBe(200)
+    expect(ctx.body.groups).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        provider: 'custom:nas',
+        label: 'nas',
+        models: ['gpt-5.4', 'gpt-5.5', 'gemini-3.5-flash-low'],
+        available_models: ['gpt-5.4', 'gpt-5.5', 'gemini-3.5-flash-low'],
+      }),
+    ]))
+    expect(ctx.body.default).toBe('gpt-5.5')
+    expect(ctx.body.default_provider).toBe('custom:nas')
+  })
+
   it('accepts OAuth providers stored in credential_pool entries', async () => {
     mockExistsSync.mockReturnValue(true)
     mockReadFileSync.mockReturnValue(JSON.stringify({
