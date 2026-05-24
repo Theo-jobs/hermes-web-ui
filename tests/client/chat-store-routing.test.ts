@@ -14,6 +14,7 @@ vi.mock('@/api/hermes/chat', () => ({
   }),
   registerSessionHandlers: vi.fn(),
   unregisterSessionHandlers: vi.fn(),
+  onPeerUserMessage: vi.fn(),
   getChatRunSocket: vi.fn(() => null),
 }))
 

@@ -17,6 +17,7 @@ import {
   type DropdownOption,
 } from "naive-ui";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import { copyToClipboard } from "@/utils/clipboard";
 import {
@@ -43,6 +44,7 @@ const appStore = useAppStore();
 const profilesStore = useProfilesStore();
 const gatewayRegistry = useGatewayRegistryStore();
 const sessionBrowserPrefsStore = useSessionBrowserPrefsStore();
+const router = useRouter();
 const message = useMessage();
 const { t } = useI18n();
 
@@ -91,10 +93,10 @@ function gatewayTargetForSession(session: Session): GatewayTargetOption | null {
   );
 }
 
-function handleSessionClick(sessionId: string) {
+async function handleSessionClick(sessionId: string) {
   const session = chatStore.sessions.find((item) => item.id === sessionId);
   const target = session ? gatewayTargetForSession(session) : null;
-  void chatStore.switchToSessionWithGatewayContext(sessionId, target
+  await chatStore.switchToSessionWithGatewayContext(sessionId, target
     ? {
       profile: target.profile,
       spaceId: target.spaceId,
@@ -103,6 +105,11 @@ function handleSessionClick(sessionId: string) {
       source: session?.source === "api_server" || session?.source === "cli" ? session.source : target.source,
     }
     : undefined);
+  await router.push({
+    name: "hermes.session",
+    params: { sessionId },
+    query: session?.profile ? { profile: session.profile } : undefined,
+  });
   if (mobileQuery?.matches) showSessions.value = false;
 }
 
@@ -544,20 +551,47 @@ function handleNewChatProviderChange(value: string) {
   newChatModel.value = newChatModelOptions.value[0]?.value || "";
 }
 
-function confirmNewChat() {
+async function confirmNewChat() {
   const target = newChatTargetOption.value;
-  chatStore.newChat({
+  const session = chatStore.newChat({
     profile: target?.profile || newChatProfile.value,
     spaceId: target?.spaceId || null,
     provider: newChatProvider.value,
     model: newChatModel.value,
     source: newChatSource.value,
   });
+  await router.push({
+    name: "hermes.session",
+    params: { sessionId: session.id },
+    query: session.profile ? { profile: session.profile } : undefined,
+  });
   showNewChatModal.value = false;
 }
 
 function handleApproval(choice: "once" | "session" | "always" | "deny") {
   chatStore.respondApproval(choice);
+}
+
+function sessionProfile(sessionId: string): string | null {
+  return chatStore.sessions.find((session) => session.id === sessionId)?.profile || null;
+}
+
+function buildSessionUrl(sessionId: string, profile?: string | null): string {
+  const href = router.resolve({
+    name: "hermes.session",
+    params: { sessionId },
+    query: profile ? { profile } : undefined,
+  }).href;
+  return `${window.location.origin}${window.location.pathname}${href}`;
+}
+
+async function copySessionLink(id?: string) {
+  const sessionId = id || chatStore.activeSessionId;
+  if (sessionId) {
+    const ok = await copyToClipboard(buildSessionUrl(sessionId, sessionProfile(sessionId)));
+    if (ok) message.success(t("common.copied"));
+    else message.error(t("common.copied") + " ✗");
+  }
 }
 
 async function copySessionId(id?: string) {
@@ -702,6 +736,7 @@ const contextMenuOptions = computed(() => {
       },
     ],
   })
+  options.push({ label: t("chat.copySessionLink"), key: "copy-link" })
   options.push({ label: t("chat.copySessionId"), key: "copy-id" })
   return options
 });
@@ -733,7 +768,9 @@ async function handleContextMenuSelect(key: string) {
     sessionBrowserPrefsStore.togglePinned(contextSessionId.value);
     return;
   }
-  if (key === "copy-id") {
+  if (key === "copy-link") {
+    copySessionLink(contextSessionId.value);
+  } else if (key === "copy-id") {
     copySessionId(contextSessionId.value);
   } else if (parseExportKey(key)) {
     const { mode, ext } = parseExportKey(key)!;

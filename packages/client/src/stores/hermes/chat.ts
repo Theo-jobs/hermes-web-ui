@@ -1,7 +1,9 @@
 import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
 import { generateFollowupSuggestions } from '@/api/hermes/followups'
+import { onPeerUserMessage } from '@/api/hermes/chat'
 import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, setSessionModel, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
-import { getApiKey } from '@/api/client'
+import { getActiveProfileName } from '@/api/client'
+import { getDownloadUrl } from '@/api/hermes/download'
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { useAppStore } from './app'
@@ -114,10 +116,14 @@ async function uploadFiles(attachments: Attachment[]): Promise<{ name: string; p
     if (att.file) formData.append('file', att.file, att.name)
   }
   const token = localStorage.getItem('hermes_api_key') || ''
+  const profileName = getActiveProfileName()
+  const headers: Record<string, string> = {}
+  if (token) headers.Authorization = `Bearer ${token}`
+  if (profileName) headers['X-Hermes-Profile'] = profileName
   const res = await fetch('/upload', {
     method: 'POST',
     body: formData,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    headers,
   })
   if (!res.ok) throw new Error(`Upload failed: ${res.status}`)
   const data = await res.json() as { files: { name: string; path: string; type?: string; size?: number }[] }
@@ -414,6 +420,14 @@ function setItemBestEffort(key: string, value: string) {
   }
 }
 
+function getItemBestEffort(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
 function removeItem(key: string) {
   try {
     localStorage.removeItem(key)
@@ -565,7 +579,7 @@ export const useChatStore = defineStore('chat', () => {
     removeItem(storageKey())
   }
 
-  async function loadSessions(profile?: string | null) {
+  async function loadSessions(profile?: string | null, preferredSessionId?: string | null) {
     const loadStartedAt = Date.now()
     isLoadingSessions.value = true
     try {
@@ -591,17 +605,23 @@ export const useChatStore = defineStore('chat', () => {
         : fresh
 
       // Restore active session for the selected next gateway/profile.
-      const targetProfile = nextSessionProfile.value || getProfileName() || 'default'
+      const targetProfile = profile || nextSessionProfile.value || getProfileName() || 'default'
       const targetSpaceId = nextSessionSpaceId.value || null
       const isTargetSession = (s: Session) =>
         (s.profile || 'default') === targetProfile && (!targetSpaceId || (s.spaceId || null) === targetSpaceId)
       const savedId = activeSessionId.value
       const savedForTarget = localStorage.getItem(profileStorageKey(targetProfile))
-      let targetId = savedId && sessions.value.some(s => s.id === savedId && isTargetSession(s))
-        ? savedId
-        : savedForTarget && sessions.value.some(s => s.id === savedForTarget && isTargetSession(s))
-          ? savedForTarget
-          : findGatewayTargetSession(targetProfile, targetSpaceId)?.id
+      const legacyActiveKey = legacyStorageKey(targetProfile)
+      const storedId = getItemBestEffort(profileStorageKey(targetProfile)) || (legacyActiveKey ? getItemBestEffort(LEGACY_STORAGE_KEY) : null)
+      let targetId = preferredSessionId && sessions.value.some(s => s.id === preferredSessionId)
+        ? preferredSessionId
+        : savedId && sessions.value.some(s => s.id === savedId && isTargetSession(s))
+          ? savedId
+          : savedForTarget && sessions.value.some(s => s.id === savedForTarget && isTargetSession(s))
+            ? savedForTarget
+            : storedId && sessions.value.some(s => s.id === storedId && isTargetSession(s))
+              ? storedId
+              : findGatewayTargetSession(targetProfile, targetSpaceId)?.id
       if (!targetId && (targetSpaceId || targetProfile !== (getProfileName() || 'default'))) {
         const draft = createSession({
           profile: targetProfile,
@@ -631,7 +651,7 @@ export const useChatStore = defineStore('chat', () => {
     const sid = activeSessionId.value
     if (!sid) return false
     try {
-      const detail = await fetchSession(sid)
+      const detail = await fetchSession(sid, activeSession.value?.profile)
       if (!detail) return false
       const target = sessions.value.find(s => s.id === sid)
       if (!target) return false
@@ -901,6 +921,15 @@ export const useChatStore = defineStore('chat', () => {
         const timeout = setTimeout(() => reject(new Error('resume timeout')), 15_000)
         resumeSession(sessionId, (data) => {
           clearTimeout(timeout)
+          if (data.session_id !== sessionId || activeSessionId.value !== sessionId) {
+            resolve()
+            return
+          }
+          const target = sessions.value.find(s => s.id === sessionId)
+          if (!target) {
+            resolve()
+            return
+          }
           if (data.isWorking) {
             serverWorking.value.add(sessionId)
           } else {
@@ -911,32 +940,31 @@ export const useChatStore = defineStore('chat', () => {
           } else {
             queueLengths.value.delete(sessionId)
           }
+          if (Array.isArray((data as any).queueMessages)) {
+            replaceQueuedUserMessages(sessionId, normalizeQueuedUserMessages((data as any).queueMessages))
+          } else if (!data.queueLength) {
+            replaceQueuedUserMessages(sessionId, [])
+          }
           if ((data as any).isAborting) {
             setAbortState({ aborting: true, synced: null })
           } else if (!data.isWorking) {
             setAbortState(null)
           }
-          if (data.inputTokens != null) targetSession.inputTokens = data.inputTokens
-          if (data.outputTokens != null) targetSession.outputTokens = data.outputTokens
-          if ((data as any).contextTokens != null) targetSession.contextTokens = (data as any).contextTokens
+          if (data.inputTokens != null) target.inputTokens = data.inputTokens
+          if (data.outputTokens != null) target.outputTokens = data.outputTokens
+          if ((data as any).contextTokens != null) target.contextTokens = (data as any).contextTokens
           if (data.messages?.length) {
-            targetSession.messages = mapHermesMessages(data.messages as any[])
-            if (!data.isWorking) {
-              // Re-opening or switching to an existing conversation should restore
-              // the follow-up chips for the latest completed assistant message.
-              // Previously followups were only generated after a live run.completed
-              // event, so refreshed sessions showed the transcript but lost the
-              // suggested next questions until another message was sent.
-              void refreshFollowups(sessionId)
-            }
+            target.messages = mapHermesMessages(data.messages as any[])
+            if (!data.isWorking) void refreshFollowups(sessionId)
           }
-          if (!targetSession.title) {
-            const firstUser = targetSession.messages.find(m => m.role === 'user')
+          if (!target.title) {
+            const firstUser = target.messages.find(m => m.role === 'user')
             if (firstUser) {
               const t = firstUser.content.slice(0, 40)
-              targetSession.title = t + (firstUser.content.length > 40 ? '...' : '')
+              target.title = t + (firstUser.content.length > 40 ? '...' : '')
             }
           }
+          activeSession.value = target
           // Process replayed events (compression state etc.)
           if (data.events?.length) {
             for (const evt of data.events) {
@@ -959,7 +987,7 @@ export const useChatStore = defineStore('chat', () => {
                   compressed: e.compressed ?? false,
                   error: e.error,
                 })
-                if (e.contextTokens != null) targetSession.contextTokens = e.contextTokens
+                if (e.contextTokens != null) target.contextTokens = e.contextTokens
               } else if (e.event === 'abort.started') {
                 setAbortState({ aborting: true, synced: null })
               } else if (e.event === 'abort.completed') {
@@ -1012,11 +1040,13 @@ export const useChatStore = defineStore('chat', () => {
                     toolResult: output,
                   })
                 }
+              } else if (String(e.event || '').startsWith('subagent.')) {
+                handleSubagentEvent(sessionId, e as RunEvent)
               }
             }
           }
           resolve()
-        })
+        }, activeSession.value?.profile)
       })
     } catch (err) {
       console.error('Failed to load session messages via resume:', err)
@@ -1027,10 +1057,12 @@ export const useChatStore = defineStore('chat', () => {
     }
 
     // Resume in-flight run event listeners if needed
-    resumeServerWorkingRun(sessionId)
+    if (activeSessionId.value === sessionId) {
+      resumeServerWorkingRun(sessionId)
+    }
   }
 
-  function newChat(options: SessionDraftOptions = {}) {
+  function newChat(options: SessionDraftOptions = {}): Session {
     const appStore = useAppStore()
     const session = createSession({
       profile: options.profile,
@@ -1048,7 +1080,8 @@ export const useChatStore = defineStore('chat', () => {
         source: normalizeSessionSource(session.source),
       }, { rebindActiveDraft: false })
     }
-    switchSession(session.id)
+    void switchSession(session.id)
+    return session
   }
 
   async function switchSessionModel(modelId: string, provider?: string, sessionId?: string): Promise<boolean> {
@@ -1069,7 +1102,8 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function deleteSession(sessionId: string) {
-    await deleteSessionApi(sessionId)
+    const target = sessions.value.find(s => s.id === sessionId)
+    await deleteSessionApi(sessionId, target?.profile)
     sessions.value = sessions.value.filter(s => s.id !== sessionId)
     if (activeSessionId.value === sessionId) {
       if (sessions.value.length > 0) {
@@ -1191,6 +1225,71 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function handleSubagentEvent(sessionId: string, evt: RunEvent) {
+    const eventName = String(evt.event || '')
+    if (!eventName.startsWith('subagent.')) return
+
+    const subagentId = String((evt as any).subagent_id || `${(evt as any).task_index ?? 0}`)
+    const toolCallId = `subagent:${evt.run_id || 'run'}:${subagentId}`
+    const taskIndex = Number((evt as any).task_index ?? 0)
+    const taskCount = Number((evt as any).task_count ?? 1)
+    const label = `${taskIndex + 1}/${Math.max(1, taskCount || 1)}`
+    const toolName = String((evt as any).tool || (evt as any).name || '')
+    const toolCount = Number((evt as any).tool_count || 0)
+    const goal = String((evt as any).goal || '').trim()
+    const text = String(evt.text || evt.preview || '').trim()
+    const summary = String((evt as any).summary || '').trim()
+    const duration = Number((evt as any).duration_seconds ?? (evt as any).duration)
+
+    let preview = text || summary || goal
+    if (eventName === 'subagent.start') {
+      preview = `subagent ${label} started${goal ? `: ${goal}` : ''}`
+    } else if (eventName === 'subagent.tool') {
+      const prefix = `subagent ${label}${toolCount ? ` turn ${toolCount}` : ''}`
+      preview = `${prefix}${toolName ? `: ${toolName}` : ''}${text ? ` - ${text}` : ''}`
+    } else if (eventName === 'subagent.progress') {
+      preview = `subagent ${label}: ${text || 'working'}`
+    } else if (eventName === 'subagent.complete') {
+      const status = String((evt as any).status || 'completed')
+      preview = `subagent ${label} ${status}${summary ? `: ${summary}` : ''}`
+    }
+
+    const msgs = getSessionMsgs(sessionId)
+    const existing = msgs.find(m => m.role === 'tool' && m.toolCallId === toolCallId)
+    const toolStatus = eventName === 'subagent.complete'
+      ? ((evt as any).status && String((evt as any).status) !== 'completed' ? 'error' : 'done')
+      : 'running'
+    const update: Partial<Message> = {
+      toolName: 'delegate_task',
+      toolCallId,
+      toolPreview: preview.slice(0, 220),
+      toolStatus,
+      toolDuration: Number.isFinite(duration) ? duration : undefined,
+      toolResult: eventName === 'subagent.complete'
+        ? JSON.stringify({
+            status: (evt as any).status || 'completed',
+            summary: summary || text,
+            api_calls: (evt as any).api_calls,
+            input_tokens: (evt as any).input_tokens,
+            output_tokens: (evt as any).output_tokens,
+          }, null, 2)
+        : undefined,
+    }
+
+    if (existing) {
+      updateMessage(sessionId, existing.id, update)
+      return
+    }
+
+    addMessage(sessionId, {
+      id: uid(),
+      role: 'tool',
+      content: '',
+      timestamp: Date.now(),
+      ...update,
+    })
+  }
+
   function addAgentErrorMessage(sessionId: string, error?: string | null) {
     const content = error ? `Error: ${error}` : 'Run failed'
     const msgs = getSessionMsgs(sessionId)
@@ -1281,23 +1380,106 @@ export const useChatStore = defineStore('chat', () => {
 
   function enqueueUserMessage(sessionId: string, message: Message) {
     const queue = queuedUserMessages.value.get(sessionId) || []
-    queue.push({ ...message, queued: true })
-    queuedUserMessages.value.set(sessionId, queue)
+    if (queue.some(item => item.id === message.id)) return
+    const nextMap = new Map(queuedUserMessages.value)
+    nextMap.set(sessionId, [...queue, { ...message, queued: true }])
+    queuedUserMessages.value = nextMap
   }
 
   function removeQueuedMessage(sessionId: string, messageId: string) {
     const queue = queuedUserMessages.value.get(sessionId)
     if (!queue?.length) return
     const next = queue.filter(message => message.id !== messageId)
+    const nextMap = new Map(queuedUserMessages.value)
     if (next.length > 0) {
-      queuedUserMessages.value.set(sessionId, next)
+      nextMap.set(sessionId, next)
     } else {
-      queuedUserMessages.value.delete(sessionId)
+      nextMap.delete(sessionId)
     }
+    queuedUserMessages.value = nextMap
     queueLengths.value.set(sessionId, next.length)
     getChatRunSocket()?.emit('cancel_queued_run', {
       session_id: sessionId,
       queue_id: messageId,
+    })
+  }
+
+  function normalizeQueuedUserMessages(rawMessages: unknown): Message[] {
+    if (!Array.isArray(rawMessages)) return []
+    return rawMessages.flatMap((raw) => {
+      const peer = raw as NonNullable<RunEvent['queued_messages']>[number]
+      const content = typeof peer?.content === 'string' ? peer.content : ''
+      const messageId = peer?.id != null ? String(peer.id) : ''
+      if (!messageId || !content.trim()) return []
+      const timestamp = typeof peer?.timestamp === 'number' && Number.isFinite(peer.timestamp)
+        ? Math.round(peer.timestamp * 1000)
+        : Date.now()
+      return [{
+        id: messageId,
+        role: 'user' as const,
+        content,
+        timestamp,
+        queued: true,
+      }]
+    })
+  }
+
+  function replaceQueuedUserMessages(sessionId: string, messages: Message[]) {
+    const existingById = new Map((queuedUserMessages.value.get(sessionId) || []).map(message => [message.id, message]))
+    const merged = messages.map(message => ({
+      ...(existingById.get(message.id) || {}),
+      ...message,
+      attachments: existingById.get(message.id)?.attachments || message.attachments,
+      queued: true,
+    }))
+    const nextMap = new Map(queuedUserMessages.value)
+    if (merged.length > 0) {
+      nextMap.set(sessionId, merged)
+    } else {
+      nextMap.delete(sessionId)
+    }
+    queuedUserMessages.value = nextMap
+  }
+
+  function handleRunQueuedEvent(sessionId: string, evt: RunEvent) {
+    const queueLength = Number((evt as any).queue_length || 0)
+    if (queueLength > 0) {
+      queueLengths.value.set(sessionId, queueLength)
+    } else {
+      queueLengths.value.delete(sessionId)
+    }
+
+    if (Array.isArray((evt as any).queued_messages) && !(evt as any).dequeued_queue_id) {
+      const queued = normalizeQueuedUserMessages((evt as any).queued_messages)
+      replaceQueuedUserMessages(sessionId, queued)
+      return
+    }
+
+    const peer = evt.message
+    const content = typeof peer?.content === 'string' ? peer.content : ''
+    const messageId = peer?.id != null ? String(peer.id) : ''
+    if (!messageId || !content.trim()) return
+
+    if ((queuedUserMessages.value.get(sessionId) || []).some(msg => msg.id === messageId)) return
+
+    const timestamp = typeof peer?.timestamp === 'number' && Number.isFinite(peer.timestamp)
+      ? Math.round(peer.timestamp * 1000)
+      : Date.now()
+    const msgs = getSessionMsgs(sessionId)
+    const existingIndex = msgs.findIndex(msg => msg.id === messageId && msg.role === 'user')
+    const existing = existingIndex >= 0 ? msgs[existingIndex] : null
+    if (existingIndex >= 0) {
+      msgs.splice(existingIndex, 1)
+    }
+
+    enqueueUserMessage(sessionId, {
+      ...(existing || {}),
+      id: messageId,
+      role: 'user',
+      content,
+      timestamp: existing?.timestamp || timestamp,
+      attachments: existing?.attachments,
+      queued: true,
     })
   }
 
@@ -1343,12 +1525,14 @@ export const useChatStore = defineStore('chat', () => {
   function showNextQueuedUserMessage(sessionId: string) {
     const queue = queuedUserMessages.value.get(sessionId)
     if (!queue?.length) return
-    const next = queue.shift()!
-    if (queue.length > 0) {
-      queuedUserMessages.value.set(sessionId, queue)
+    const [next, ...rest] = queue
+    const nextMap = new Map(queuedUserMessages.value)
+    if (rest.length > 0) {
+      nextMap.set(sessionId, rest)
     } else {
-      queuedUserMessages.value.delete(sessionId)
+      nextMap.delete(sessionId)
     }
+    queuedUserMessages.value = nextMap
     addMessage(sessionId, { ...next, queued: false })
     updateSessionTitle(sessionId)
   }
@@ -1424,11 +1608,9 @@ export const useChatStore = defineStore('chat', () => {
         const uploaded = await uploadFiles(attachments)
 
         // Update attachment URLs on the user message for display
-        const token = getApiKey()
         const urlMap = new Map(uploaded.map(f => {
-          const base = `/api/hermes/download?path=${encodeURIComponent(f.path)}&name=${encodeURIComponent(f.name)}`
           return [f.name, {
-            url: token ? `${base}&token=${encodeURIComponent(token)}` : base,
+            url: getDownloadUrl(f.path, f.name),
             path: f.path,
             media_type: f.type,
             size: f.size,
@@ -1551,7 +1733,7 @@ export const useChatStore = defineStore('chat', () => {
               break
 
             case 'run.queued': {
-              queueLengths.value.set(sid, (evt as any).queue_length || 0)
+              handleRunQueuedEvent(sid, evt)
               break
             }
 
@@ -1758,6 +1940,15 @@ export const useChatStore = defineStore('chat', () => {
               break
             }
 
+            case 'subagent.start':
+            case 'subagent.tool':
+            case 'subagent.progress':
+            case 'subagent.complete': {
+              runHadToolActivity = true
+              handleSubagentEvent(sid, evt)
+              break
+            }
+
             case 'approval.requested': {
               setPendingApproval(evt)
               break
@@ -1950,11 +2141,11 @@ export const useChatStore = defineStore('chat', () => {
    * Emits 'resume' to join the session room on the server,
    * then sets up event listeners to receive ongoing events.
    */
-  function resumeServerWorkingRun(sid: string) {
+  function resumeServerWorkingRun(sid: string, force = false) {
     // Don't register duplicate listeners if already streaming
     if (streamStates.value.has(sid)) return
     // Only set up listeners if the server reported an active run during resume.
-    if (!serverWorking.value.has(sid)) return
+    if (!force && !serverWorking.value.has(sid)) return
 
     let closed = false
     let runProducedAssistantText = false
@@ -1991,7 +2182,7 @@ export const useChatStore = defineStore('chat', () => {
       if (evt.session_id && evt.session_id !== sid) return
       switch (evt.event) {
         case 'run.queued': {
-          queueLengths.value.set(sid, (evt as any).queue_length || 0)
+          handleRunQueuedEvent(sid, evt)
           break
         }
 
@@ -2201,6 +2392,15 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
+        case 'subagent.start':
+        case 'subagent.tool':
+        case 'subagent.progress':
+        case 'subagent.complete': {
+          runHadToolActivity = true
+          handleSubagentEvent(sid, evt)
+          break
+        }
+
         case 'approval.requested': {
           setPendingApproval(evt)
           break
@@ -2351,6 +2551,7 @@ export const useChatStore = defineStore('chat', () => {
       onReasoningAvailable: (evt) => handleEvent(evt),
       onToolStarted: (evt) => handleEvent(evt),
       onToolCompleted: (evt) => handleEvent(evt),
+      onSubagentEvent: (evt) => handleEvent(evt),
       onRunStarted: (evt) => handleEvent(evt),
       onRunCompleted: (evt) => handleEvent(evt),
       onRunFailed: (evt) => handleEvent(evt),
@@ -2376,6 +2577,50 @@ export const useChatStore = defineStore('chat', () => {
       },
     })
   }
+
+  function handlePeerUserMessage(evt: RunEvent) {
+    const sid = evt.session_id
+    if (!sid || activeSessionId.value !== sid || !activeSession.value) return
+
+    const peer = evt.message
+    const content = typeof peer?.content === 'string' ? peer.content : ''
+    if (!content.trim()) return
+
+    const messageId = peer?.id != null ? String(peer.id) : ''
+    const msgs = getSessionMsgs(sid)
+    if (messageId && msgs.some(msg => msg.id === messageId)) {
+      serverWorking.value.add(sid)
+      resumeServerWorkingRun(sid, true)
+      return
+    }
+    if (messageId && (queuedUserMessages.value.get(sid) || []).some(msg => msg.id === messageId)) {
+      serverWorking.value.add(sid)
+      resumeServerWorkingRun(sid, true)
+      return
+    }
+
+    const timestamp = typeof peer?.timestamp === 'number' && Number.isFinite(peer.timestamp)
+      ? Math.round(peer.timestamp * 1000)
+      : Date.now()
+
+    const message: Message = {
+      id: messageId || uid(),
+      role: 'user',
+      content,
+      timestamp,
+      queued: !!peer?.queued,
+    }
+    if (peer?.queued) {
+      enqueueUserMessage(sid, message)
+    } else {
+      addMessage(sid, message)
+      updateSessionTitle(sid)
+    }
+    serverWorking.value.add(sid)
+    resumeServerWorkingRun(sid, true)
+  }
+
+  onPeerUserMessage(handlePeerUserMessage)
 
   function stopStreaming() {
     const sid = activeSessionId.value
@@ -2425,7 +2670,7 @@ export const useChatStore = defineStore('chat', () => {
               if (!data.isWorking) void refreshFollowups(sid)
             }
             resumeServerWorkingRun(sid)
-          })
+          }, activeSession.value?.profile)
         }
       }
     })

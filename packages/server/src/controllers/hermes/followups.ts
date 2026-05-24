@@ -6,6 +6,7 @@ interface FollowupMessage {
 }
 
 const DEFAULT_SUGGESTIONS = ['继续深入一下', '还有哪些注意点？', '下一步怎么做？']
+const FOLLOWUP_REASONING_EFFORT = process.env.EKKO_FOLLOWUP_REASONING_EFFORT || 'xhigh'
 const MAX_CONTEXT_MESSAGES = 6
 const MAX_CONTENT_CHARS = 1600
 
@@ -114,6 +115,7 @@ async function callFastModel(messages: FollowupMessage[], profile?: string): Pro
       stream: false,
       store: false,
       max_output_tokens: 160,
+      reasoning: { enabled: true, effort: FOLLOWUP_REASONING_EFFORT },
     }),
     signal: AbortSignal.timeout(12_000),
   })

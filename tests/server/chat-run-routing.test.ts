@@ -41,7 +41,10 @@ vi.mock('../../packages/server/src/db/hermes/usage-store', () => ({
   updateUsage: vi.fn(),
 }))
 
-import { resolveSessionBoundRunConfig } from '../../packages/server/src/services/hermes/run-chat/handle-api-run'
+import {
+  attachHermesSessionScope,
+  resolveSessionBoundRunConfig,
+} from '../../packages/server/src/services/hermes/run-chat/handle-api-run'
 
 describe('chat run routing', () => {
   it('lets the requested profile bind the first run of an empty persisted draft session', () => {
@@ -64,5 +67,38 @@ describe('chat run routing', () => {
     )
 
     expect(bound).toEqual({ profile: 'default', model: 'local-model' })
+  })
+
+  it('forwards the local API-server session as Hermes session scope', () => {
+    const body: Record<string, any> = { input: 'hello' }
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+
+    attachHermesSessionScope(body, headers, 'ekko-session-1', true)
+
+    expect(body.session_id).toBe('ekko-session-1')
+    expect(headers['X-Hermes-Session-Id']).toBe('ekko-session-1')
+    expect(headers['X-Hermes-Session-Key']).toBe('ekko-session-1')
+  })
+
+  it('does not forward unsafe session scope headers', () => {
+    const body: Record<string, any> = { input: 'hello' }
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+
+    attachHermesSessionScope(body, headers, 'bad-session\r\nX-Bad: 1', true)
+
+    expect(body.session_id).toBeUndefined()
+    expect(headers['X-Hermes-Session-Id']).toBeUndefined()
+    expect(headers['X-Hermes-Session-Key']).toBeUndefined()
+  })
+
+  it('does not forward session scope without upstream API authentication', () => {
+    const body: Record<string, any> = { input: 'hello' }
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+
+    attachHermesSessionScope(body, headers, 'ekko-session-1', false)
+
+    expect(body.session_id).toBeUndefined()
+    expect(headers['X-Hermes-Session-Id']).toBeUndefined()
+    expect(headers['X-Hermes-Session-Key']).toBeUndefined()
   })
 })

@@ -5,6 +5,7 @@ const getConversationDetailFromDbMock = vi.fn()
 const listConversationSummariesMock = vi.fn()
 const getConversationDetailMock = vi.fn()
 const getSessionDetailFromDbMock = vi.fn()
+const getSessionDetailFromDbWithProfileMock = vi.fn()
 const getExactSessionDetailFromDbWithProfileMock = vi.fn()
 const getUsageStatsFromDbMock = vi.fn()
 const getSessionMock = vi.fn()
@@ -54,6 +55,7 @@ vi.mock('../../packages/server/src/db/hermes/sessions-db', () => ({
   listSessionSummaries: vi.fn(),
   searchSessionSummaries: vi.fn(),
   getSessionDetailFromDb: getSessionDetailFromDbMock,
+  getSessionDetailFromDbWithProfile: getSessionDetailFromDbWithProfileMock,
   getExactSessionDetailFromDbWithProfile: getExactSessionDetailFromDbWithProfileMock,
   getUsageStatsFromDb: getUsageStatsFromDbMock,
 }))
@@ -120,6 +122,7 @@ describe('session conversations controller', () => {
     listConversationSummariesMock.mockReset()
     getConversationDetailMock.mockReset()
     getSessionDetailFromDbMock.mockReset()
+    getSessionDetailFromDbWithProfileMock.mockReset()
     getExactSessionDetailFromDbWithProfileMock.mockReset()
     getUsageStatsFromDbMock.mockReset()
     getSessionMock.mockReset()
@@ -174,7 +177,7 @@ describe('session conversations controller', () => {
     const ctx: any = { query: { humanOnly: 'true', limit: '5' }, body: null }
     await mod.listConversations(ctx)
 
-    expect(localListSessionsMock).toHaveBeenCalledWith('default', undefined, 5)
+    expect(localListSessionsMock).toHaveBeenCalledWith(undefined, undefined, 5)
     expect(listConversationSummariesMock).not.toHaveBeenCalled()
     expect(ctx.body.sessions[0]).toMatchObject({ id: 'local-conversation', source: 'cli', title: 'Local' })
   })
@@ -310,6 +313,33 @@ describe('session conversations controller', () => {
     })
   })
 
+  it('reads Hermes history detail from the requested profile database', async () => {
+    localGetSessionDetailMock.mockReturnValue(null)
+    getSessionDetailFromDbWithProfileMock.mockResolvedValue({
+      id: 'travel-session',
+      source: 'cli',
+      title: 'Travel detail',
+      messages: [
+        { id: 1, session_id: 'travel-session', role: 'user', content: 'from travel', timestamp: 1 },
+      ],
+    })
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { params: { id: 'travel-session' }, query: { profile: 'travel' }, body: null }
+    await mod.getHermesSession(ctx)
+
+    expect(localGetSessionDetailMock).toHaveBeenCalledWith('travel-session')
+    expect(getSessionDetailFromDbWithProfileMock).toHaveBeenCalledWith('travel-session', 'travel')
+    expect(getSessionDetailFromDbMock).not.toHaveBeenCalled()
+    expect(getSessionMock).not.toHaveBeenCalled()
+    expect(ctx.body.session).toMatchObject({
+      id: 'travel-session',
+      profile: 'travel',
+      title: 'Travel detail',
+      messages: [{ content: 'from travel' }],
+    })
+  })
+
   it('does not return api_server sessions from the Hermes history detail endpoint', async () => {
     localGetSessionDetailMock.mockReturnValue({
       id: 'api-1',
@@ -332,20 +362,6 @@ describe('session conversations controller', () => {
 
   it('returns native state.db usage analytics for the requested period', async () => {
     const today = new Date().toISOString().slice(0, 10)
-    getLocalUsageStatsMock.mockReturnValue({
-      input_tokens: 10,
-      output_tokens: 5,
-      cache_read_tokens: 2,
-      cache_write_tokens: 1,
-      reasoning_tokens: 3,
-      sessions: 1,
-      by_model: [
-        { model: 'local-model', input_tokens: 10, output_tokens: 5, cache_read_tokens: 2, cache_write_tokens: 1, reasoning_tokens: 3, sessions: 1 },
-      ],
-      by_day: [
-        { date: today, input_tokens: 10, output_tokens: 5, cache_read_tokens: 2, cache_write_tokens: 1, sessions: 1, errors: 0, cost: 0 },
-      ],
-    })
     getUsageStatsFromDbMock.mockResolvedValue({
       input_tokens: 20,
       output_tokens: 10,
@@ -367,46 +383,65 @@ describe('session conversations controller', () => {
     const ctx: any = { query: { days: '2' }, body: null }
     await mod.usageStats(ctx)
 
-    expect(getLocalUsageStatsMock).toHaveBeenCalledWith('default', 2)
     expect(getUsageStatsFromDbMock).toHaveBeenCalledWith(2)
     expect(ctx.body).toMatchObject({
-      total_input_tokens: 30,
-      total_output_tokens: 15,
-      total_cache_read_tokens: 6,
-      total_cache_write_tokens: 3,
-      total_reasoning_tokens: 9,
-      total_sessions: 3,
+      total_input_tokens: 20,
+      total_output_tokens: 10,
+      total_cache_read_tokens: 4,
+      total_cache_write_tokens: 2,
+      total_reasoning_tokens: 6,
+      total_sessions: 2,
       total_cost: 0.02,
       total_api_calls: 7,
       period_days: 2,
     })
     expect(ctx.body.model_usage).toEqual([
       { model: 'hermes-model', input_tokens: 20, output_tokens: 10, cache_read_tokens: 4, cache_write_tokens: 2, reasoning_tokens: 6, sessions: 2 },
-      { model: 'local-model', input_tokens: 10, output_tokens: 5, cache_read_tokens: 2, cache_write_tokens: 1, reasoning_tokens: 3, sessions: 1 },
     ])
     expect(ctx.body.daily_usage.find((row: any) => row.date === today)).toMatchObject({
-      input_tokens: 30,
-      output_tokens: 15,
-      cache_read_tokens: 6,
-      cache_write_tokens: 3,
-      sessions: 3,
+      input_tokens: 20,
+      output_tokens: 10,
+      cache_read_tokens: 4,
+      cache_write_tokens: 2,
+      sessions: 2,
       cost: 0.02,
     })
   })
 
-  it('normalizes and merges blank model usage from local and state.db analytics', async () => {
-    getLocalUsageStatsMock.mockReturnValue({
-      input_tokens: 3,
-      output_tokens: 1,
-      cache_read_tokens: 2,
-      cache_write_tokens: 0,
-      reasoning_tokens: 0,
+  it('loads usage analytics from the request-scoped profile state database', async () => {
+    getUsageStatsFromDbMock.mockResolvedValue({
+      input_tokens: 12,
+      output_tokens: 6,
+      cache_read_tokens: 3,
+      cache_write_tokens: 1,
+      reasoning_tokens: 2,
       sessions: 1,
+      cost: 0.01,
+      total_api_calls: 4,
       by_model: [
-        { model: '', input_tokens: 3, output_tokens: 1, cache_read_tokens: 2, cache_write_tokens: 0, reasoning_tokens: 0, sessions: 1 },
+        { model: 'research-model', input_tokens: 12, output_tokens: 6, cache_read_tokens: 3, cache_write_tokens: 1, reasoning_tokens: 2, sessions: 1 },
       ],
       by_day: [],
     })
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = { query: { days: '2' }, state: { profile: { name: 'research' } }, body: null }
+    await mod.usageStats(ctx)
+
+    expect(getUsageStatsFromDbMock).toHaveBeenCalledWith(2, undefined, 'research')
+    expect(ctx.body).toMatchObject({
+      total_input_tokens: 12,
+      total_output_tokens: 6,
+      total_sessions: 1,
+      total_cost: 0.01,
+      total_api_calls: 4,
+    })
+    expect(ctx.body.model_usage).toEqual([
+      { model: 'research-model', input_tokens: 12, output_tokens: 6, cache_read_tokens: 3, cache_write_tokens: 1, reasoning_tokens: 2, sessions: 1 },
+    ])
+  })
+
+  it('keeps blank model usage as returned by state.db analytics', async () => {
     getUsageStatsFromDbMock.mockResolvedValue({
       input_tokens: 2,
       output_tokens: 1,
@@ -427,7 +462,7 @@ describe('session conversations controller', () => {
     await mod.usageStats(ctx)
 
     expect(ctx.body.model_usage).toEqual([
-      { model: 'unknown', input_tokens: 5, output_tokens: 2, cache_read_tokens: 3, cache_write_tokens: 1, reasoning_tokens: 0, sessions: 2 },
+      { model: ' ', input_tokens: 2, output_tokens: 1, cache_read_tokens: 1, cache_write_tokens: 1, reasoning_tokens: 0, sessions: 1 },
     ])
   })
 

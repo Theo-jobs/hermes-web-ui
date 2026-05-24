@@ -1,5 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
-import { hasApiKey } from '@/api/client'
+import { hasApiKey, isStoredSuperAdmin } from '@/api/client'
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -16,8 +16,18 @@ const router = createRouter({
       component: () => import('@/views/hermes/ChatView.vue'),
     },
     {
+      path: '/hermes/session/:sessionId',
+      name: 'hermes.session',
+      component: () => import('@/views/hermes/ChatView.vue'),
+    },
+    {
       path: '/hermes/history',
       name: 'hermes.history',
+      component: () => import('@/views/hermes/HistoryView.vue'),
+    },
+    {
+      path: '/hermes/history/session/:sessionId',
+      name: 'hermes.historySession',
       component: () => import('@/views/hermes/HistoryView.vue'),
     },
     {
@@ -44,6 +54,7 @@ const router = createRouter({
       path: '/hermes/profiles',
       name: 'hermes.profiles',
       component: () => import('@/views/hermes/ProfilesView.vue'),
+      meta: { requiresSuperAdmin: true },
     },
     {
       path: '/hermes/logs',
@@ -59,6 +70,7 @@ const router = createRouter({
       path: '/hermes/performance',
       name: 'hermes.performance',
       component: () => import('@/views/hermes/PerformanceView.vue'),
+      meta: { requiresSuperAdmin: true },
     },
     {
       path: '/hermes/skills-usage',
@@ -101,6 +113,11 @@ const router = createRouter({
       component: () => import('@/views/hermes/GroupChatView.vue'),
     },
     {
+      path: '/hermes/group-chat/room/:roomId',
+      name: 'hermes.groupChatRoom',
+      component: () => import('@/views/hermes/GroupChatView.vue'),
+    },
+    {
       path: '/hermes/files',
       name: 'hermes.files',
       component: () => import('@/views/hermes/FilesView.vue'),
@@ -123,6 +140,11 @@ router.beforeEach((to, _from, next) => {
   // All other pages require token
   if (!hasApiKey()) {
     next({ name: 'login' })
+    return
+  }
+
+  if (to.meta.requiresSuperAdmin && !isStoredSuperAdmin()) {
+    next({ name: 'hermes.chat' })
     return
   }
 

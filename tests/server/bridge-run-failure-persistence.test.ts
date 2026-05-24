@@ -73,6 +73,13 @@ function createSocket() {
     connected: true,
     emitted,
     join: vi.fn(),
+    to(room: string) {
+      return {
+        emit(event: string, payload: any) {
+          emitted.push({ event: `${room}:${event}`, payload })
+        },
+      }
+    },
     emit(event: string, payload: any) {
       emitted.push({ event, payload })
     },

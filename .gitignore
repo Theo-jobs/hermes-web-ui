@@ -46,5 +46,7 @@ CLAUDE.md
 # Local agent task records and rollback snapshots
 .agent-tasks/
 .update-backups/
+.claude-task-*.md
+.codex-task-*.md
 # Client source map artifacts
 packages/client/src/**/*.js
