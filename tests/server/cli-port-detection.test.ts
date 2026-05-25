@@ -125,6 +125,22 @@ describe('CLI port detection', () => {
     }
   })
 
+  it('cleans a stale server PID file during stop', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'hermes-web-ui-cli-stale-pid-'))
+    process.env.HERMES_WEB_UI_HOME = home
+    const pidFile = join(home, 'server.pid')
+    writeFileSync(pidFile, '999999999\n')
+
+    try {
+      const { stopDaemon } = await loadCli()
+      stopDaemon()
+
+      expect(existsSync(pidFile)).toBe(false)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
   it('resets an existing admin user to the default password', async () => {
     const home = mkdtempSync(join(tmpdir(), 'hermes-web-ui-cli-default-login-'))
     process.env.HERMES_WEB_UI_HOME = home
@@ -132,7 +148,7 @@ describe('CLI port detection', () => {
 
     try {
       const { resetDefaultLogin } = await loadCli()
-      const created = resetDefaultLogin({ silent: true })
+      const created = await resetDefaultLogin({ silent: true })
       expect(created.action).toBe('created')
 
       const db = new DatabaseSync(dbPath)
@@ -144,7 +160,7 @@ describe('CLI port detection', () => {
         db.close()
       }
 
-      const updated = resetDefaultLogin({ silent: true })
+      const updated = await resetDefaultLogin({ silent: true })
       expect(updated.action).toBe('updated')
 
       const verifyDb = new DatabaseSync(dbPath)

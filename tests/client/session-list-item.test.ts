@@ -10,6 +10,28 @@ vi.mock('vue-i18n', () => ({
   useI18n: () => ({ t: (key: string) => key }),
 }))
 
+vi.mock('@/shared/session-display', () => ({
+  formatTimestampMs: () => 'now',
+}))
+
+vi.mock('naive-ui', () => ({
+  NPopconfirm: {
+    name: 'NPopconfirm',
+    emits: ['positive-click'],
+    template: '<span><slot name="trigger" /><slot /></span>',
+  },
+  NCheckbox: {
+    name: 'NCheckbox',
+    props: ['checked'],
+    emits: ['click'],
+    template: '<input type="checkbox" :checked="checked" @click="$emit(\'click\')" />',
+  },
+  NTooltip: {
+    name: 'NTooltip',
+    template: '<span><slot name="trigger" /><slot /></span>',
+  },
+}))
+
 function baseSession(profile: string, overrides: Record<string, unknown> = {}) {
   return {
     id: `${profile}-session`,
@@ -33,39 +55,94 @@ function mountItem(profile: string, overrides: Record<string, unknown> = {}) {
       pinned: false,
       canDelete: false,
       showProfile: true,
+      ...overrides,
     },
     global: {
       stubs: {
-        NTooltip: { template: '<div><slot name="trigger" /><slot /></div>' },
-        NPopconfirm: { template: '<div><slot name="trigger" /><slot /></div>' },
+        ProfileAvatar: true,
       },
     },
   })
 }
 
-describe('SessionListItem gateway model availability', () => {
+function seedGatewayStores() {
+  const appStore = useAppStore()
+  appStore.profileModelGroups = [{
+    profile: 'default',
+    default: 'gpt-5.5',
+    default_provider: 'openai-codex',
+    groups: [{ provider: 'openai-codex', label: 'Codex', base_url: '', api_key: '', models: ['gpt-5.5'] }],
+  }]
+  appStore.modelGroups = [{ provider: 'openai-codex', label: 'Codex', base_url: '', api_key: '', models: ['gpt-5.5'] }]
+  appStore.selectedProvider = 'openai-codex'
+  appStore.selectedModel = 'gpt-5.5'
+
+  const gatewayRegistry = useGatewayRegistryStore()
+  gatewayRegistry.gateways = [
+    { id: 'hefeng', profile: 'hefeng', type: 'remote', displayName: 'Hefeng remote' },
+  ]
+  gatewayRegistry.loading = false
+  gatewayRegistry.loaded = true
+  vi.spyOn(gatewayRegistry, 'fetchAll').mockResolvedValue(undefined)
+}
+
+describe('SessionListItem', () => {
   beforeEach(() => {
     localStorage.clear()
     setActivePinia(createPinia())
+    seedGatewayStores()
+  })
 
-    const appStore = useAppStore()
-    appStore.profileModelGroups = [{
-      profile: 'default',
-      default: 'gpt-5.5',
-      default_provider: 'openai-codex',
-      groups: [{ provider: 'openai-codex', label: 'Codex', base_url: '', api_key: '', models: ['gpt-5.5'] }],
-    }]
-    appStore.modelGroups = [{ provider: 'openai-codex', label: 'Codex', base_url: '', api_key: '', models: ['gpt-5.5'] }]
-    appStore.selectedProvider = 'openai-codex'
-    appStore.selectedModel = 'gpt-5.5'
+  it('renders normal mode as a link to the session route', () => {
+    const wrapper = mountItem('kira', {
+      id: 's1',
+      title: 'Session One',
+      model: 'gpt-test',
+      provider: 'openai',
+      to: '/session/s1',
+      canDelete: true,
+    })
 
-    const gatewayRegistry = useGatewayRegistryStore()
-    gatewayRegistry.gateways = [
-      { id: 'hefeng', profile: 'hefeng', type: 'remote', displayName: 'Hefeng remote' },
-    ]
-    gatewayRegistry.loading = false
-    gatewayRegistry.loaded = true
-    vi.spyOn(gatewayRegistry, 'fetchAll').mockResolvedValue(undefined)
+    const link = wrapper.get('a.session-item')
+    expect(link.attributes('href')).toBe('/session/s1')
+    expect(wrapper.find('button.session-item').exists()).toBe(false)
+  })
+
+  it('renders selectable mode as a button and does not expose row href', () => {
+    const wrapper = mountItem('kira', {
+      id: 's1',
+      selectable: true,
+      selected: false,
+      to: '/session/s1',
+      canDelete: true,
+    })
+
+    expect(wrapper.find('button.session-item').exists()).toBe(true)
+    expect(wrapper.find('a.session-item').exists()).toBe(false)
+  })
+
+  it('does not select the row when clicking nested action controls', async () => {
+    const wrapper = mountItem('kira', {
+      id: 's1',
+      to: '/session/s1',
+      canDelete: true,
+    })
+
+    await wrapper.get('button.session-item-delete').trigger('click')
+    expect(wrapper.emitted('select')).toBeUndefined()
+  })
+
+  it('does not hijack modified clicks on normal links', async () => {
+    const wrapper = mountItem('kira', {
+      id: 's1',
+      to: '/session/s1',
+      canDelete: true,
+    })
+
+    const link = wrapper.get('a.session-item')
+    link.element.addEventListener('click', event => event.preventDefault())
+    await link.trigger('click', { ctrlKey: true })
+    expect(wrapper.emitted('select')).toBeUndefined()
   })
 
   it('does not mark registered remote gateway sessions as missing models when global models are available', () => {

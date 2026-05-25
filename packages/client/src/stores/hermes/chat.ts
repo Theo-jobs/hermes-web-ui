@@ -1,6 +1,5 @@
-import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
+import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, onPeerUserMessage, respondClarify, type RunEvent, type ResumeSessionPayload, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
 import { generateFollowupSuggestions } from '@/api/hermes/followups'
-import { onPeerUserMessage } from '@/api/hermes/chat'
 import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, setSessionModel, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
 import { getActiveProfileName } from '@/api/client'
 import { getDownloadUrl } from '@/api/hermes/download'
@@ -58,6 +57,15 @@ export interface PendingApproval {
   description: string
   choices: Array<'once' | 'session' | 'always' | 'deny'>
   allowPermanent: boolean
+  requestedAt: number
+}
+
+export interface PendingClarify {
+  sessionId: string
+  clarifyId: string
+  question: string
+  choices: string[] | null
+  timeoutMs: number
   requestedAt: number
 }
 
@@ -462,6 +470,12 @@ export const useChatStore = defineStore('chat', () => {
   const activePendingApproval = computed(() => {
     const sid = activeSessionId.value
     return sid ? pendingApprovals.value.get(sid) || null : null
+  })
+
+  const pendingClarifies = ref<Map<string, PendingClarify>>(new Map())
+  const activePendingClarify = computed(() => {
+    const sid = activeSessionId.value
+    return sid ? pendingClarifies.value.get(sid) || null : null
   })
 
   // 自动播放语音开关
@@ -996,6 +1010,10 @@ export const useChatStore = defineStore('chat', () => {
                 setPendingApproval({ ...e, session_id: sessionId } as RunEvent)
               } else if (e.event === 'approval.resolved') {
                 clearPendingApproval({ ...e, session_id: sessionId } as RunEvent)
+              } else if (e.event === 'clarify.requested') {
+                setPendingClarify({ ...e, session_id: sessionId } as RunEvent)
+              } else if (e.event === 'clarify.resolved') {
+                clearPendingClarify({ ...e, session_id: sessionId } as RunEvent)
               } else if (e.event === 'run.failed') {
                 addAgentErrorMessage(sessionId, e.error)
                 serverWorking.value.delete(sessionId)
@@ -1514,6 +1532,41 @@ export const useChatStore = defineStore('chat', () => {
     pendingApprovals.value = new Map(pendingApprovals.value)
   }
 
+  function setPendingClarify(evt: RunEvent) {
+    const sid = evt.session_id
+    const clarifyId = (evt as any).clarify_id as string | undefined
+    if (!sid || !clarifyId) return
+    pendingClarifies.value.set(sid, {
+      sessionId: sid,
+      clarifyId,
+      question: String((evt as any).question || ''),
+      choices: Array.isArray((evt as any).choices) ? (evt as any).choices : null,
+      timeoutMs: Number((evt as any).timeout_ms) || 300000,
+      requestedAt: Date.now(),
+    })
+    pendingClarifies.value = new Map(pendingClarifies.value)
+  }
+
+  function clearPendingClarify(evt: RunEvent) {
+    const sid = evt.session_id
+    if (!sid) return
+    const current = pendingClarifies.value.get(sid)
+    if (!current) return
+    const clarifyId = (evt as any).clarify_id
+    if (clarifyId && current.clarifyId !== clarifyId) return
+    pendingClarifies.value.delete(sid)
+    pendingClarifies.value = new Map(pendingClarifies.value)
+  }
+
+  function respondToClarify(response: string) {
+    const pending = activePendingClarify.value
+    if (!pending) return
+    respondClarify(pending.sessionId, pending.clarifyId, response)
+    pendingClarifies.value.delete(pending.sessionId)
+    pendingClarifies.value = new Map(pendingClarifies.value)
+  }
+
+
   function respondApproval(choice: PendingApproval['choices'][number]) {
     const pending = activePendingApproval.value
     if (!pending) return
@@ -1710,6 +1763,107 @@ export const useChatStore = defineStore('chat', () => {
           }
         })
         activeAssistantMessageId = null
+      }
+
+      const applyReconnectResume = (data: ResumeSessionPayload) => {
+        if (data.session_id !== sid) return
+        const target = sessions.value.find(s => s.id === sid)
+        if (!target) return
+
+        if (data.isWorking) serverWorking.value.add(sid)
+        else serverWorking.value.delete(sid)
+
+        if (data.queueLength && data.queueLength > 0) {
+          queueLengths.value.set(sid, data.queueLength)
+        } else {
+          queueLengths.value.delete(sid)
+        }
+
+        if (Array.isArray(data.queueMessages)) {
+          replaceQueuedUserMessages(sid, normalizeQueuedUserMessages(data.queueMessages))
+        } else if (!data.queueLength) {
+          replaceQueuedUserMessages(sid, [])
+        }
+
+        if (data.isAborting) {
+          setAbortState({ aborting: true, synced: null })
+        } else if (!data.isWorking) {
+          setAbortState(null)
+        }
+
+        if (data.inputTokens != null) target.inputTokens = data.inputTokens
+        if (data.outputTokens != null) target.outputTokens = data.outputTokens
+        if (data.contextTokens != null) target.contextTokens = data.contextTokens
+
+        if (Array.isArray(data.messages)) {
+          target.messages = mapHermesMessages(data.messages as any[])
+          const lastAssistant = [...target.messages].reverse().find(m => m.role === 'assistant')
+          if (data.isWorking && lastAssistant) {
+            lastAssistant.isStreaming = true
+            activeAssistantMessageId = lastAssistant.id
+            if (lastAssistant.reasoning) noteReasoningStart(lastAssistant.id)
+          } else {
+            activeAssistantMessageId = null
+          }
+        }
+
+        if (data.events?.length) {
+          for (const evt of data.events) {
+            const e = evt.data as RunEvent
+            switch (e.event) {
+              case 'compression.started':
+                setCompressionStateForSession(sid, {
+                  compressing: true,
+                  messageCount: (e as any).message_count || 0,
+                  beforeTokens: (e as any).token_count || 0,
+                  afterTokens: 0,
+                  compressed: null,
+                })
+                break
+              case 'compression.completed': {
+                const afterTokens = (e as any).contextTokens || (e as any).afterTokens || 0
+                setCompressionStateForSession(sid, {
+                  compressing: false,
+                  messageCount: (e as any).totalMessages || 0,
+                  beforeTokens: (e as any).beforeTokens || 0,
+                  afterTokens,
+                  compressed: (e as any).compressed ?? false,
+                  error: (e as any).error,
+                })
+                if ((e as any).contextTokens != null) target.contextTokens = (e as any).contextTokens
+                break
+              }
+              case 'abort.started':
+                setAbortState({ aborting: true, synced: null })
+                break
+              case 'abort.completed':
+                setAbortState({ aborting: false, synced: (e as any).synced ?? false })
+                break
+              case 'approval.requested':
+                setPendingApproval({ ...e, session_id: sid })
+                break
+              case 'approval.resolved':
+                clearPendingApproval({ ...e, session_id: sid })
+                break
+              case 'clarify.requested':
+                setPendingClarify({ ...e, session_id: sid })
+                break
+              case 'clarify.resolved':
+                clearPendingClarify({ ...e, session_id: sid })
+                break
+              case 'run.failed':
+                addAgentErrorMessage(sid, e.error)
+                break
+            }
+          }
+        }
+
+        if (activeSessionId.value === sid) activeSession.value = target
+        if (!data.isWorking && !(data.queueLength && data.queueLength > 0)) {
+          cleanup()
+          activeAssistantMessageId = null
+          updateSessionTitle(sid)
+        }
       }
 
       // Send run via Socket.IO and listen to streamed events — all closures capture `sid`
@@ -1959,6 +2113,16 @@ export const useChatStore = defineStore('chat', () => {
               break
             }
 
+            case 'clarify.requested': {
+              setPendingClarify(evt)
+              break
+            }
+
+            case 'clarify.resolved': {
+              clearPendingClarify(evt)
+              break
+            }
+
             case 'run.completed': {
               const msgs = getSessionMsgs(sid)
               const lastMsg = activeAssistantMessageId
@@ -2123,6 +2287,7 @@ export const useChatStore = defineStore('chat', () => {
           cleanup()
         },
         undefined,
+        { onReconnectResume: applyReconnectResume },
       )
 
       streamStates.value.set(sid, ctrl)
@@ -2411,6 +2576,16 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
+        case 'clarify.requested': {
+          setPendingClarify(evt)
+          break
+        }
+
+        case 'clarify.resolved': {
+          clearPendingClarify(evt)
+          break
+        }
+
         case 'run.completed': {
           const hasQueue = (evt as any).queue_remaining > 0
           if (hasQueue) {
@@ -2564,6 +2739,8 @@ export const useChatStore = defineStore('chat', () => {
       onRunQueued: (evt) => handleEvent(evt),
       onApprovalRequested: (evt) => handleEvent(evt),
       onApprovalResolved: (evt) => handleEvent(evt),
+      onClarifyRequested: (evt) => handleEvent(evt),
+      onClarifyResolved: (evt) => handleEvent(evt),
     })
 
     // No need to emit resume here — switchSession already did it.
@@ -2773,6 +2950,7 @@ export const useChatStore = defineStore('chat', () => {
     queuedUserMessages,
     pendingApprovals,
     activePendingApproval,
+    activePendingClarify,
     removeQueuedMessage,
     isLoadingSessions,
     sessionsLoaded,
@@ -2793,6 +2971,7 @@ export const useChatStore = defineStore('chat', () => {
     sendMessage,
     stopStreaming,
     respondApproval,
+    respondToClarify,
     loadSessions,
     refreshActiveSession,
     getThinkingObservation,
